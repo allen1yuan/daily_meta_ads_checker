@@ -7,7 +7,7 @@ INK = {
     "primary": "#0b0b0b", "secondary": "#52514e", "muted": "#898781",
     "grid": "#e1e0d9", "baseline": "#c3c2b7", "surface": "#fcfcfb",
 }
-CAT = {"blue": "#2a78d6", "orange": "#eb6834", "aqua": "#1baf7a"}
+CAT = {"blue": "#2a78d6", "orange": "#eb6834", "aqua": "#1baf7a", "violet": "#4a3aa7", "yellow": "#eda100"}
 STATUS = {"good": "#0ca30c", "warning": "#fab219", "critical": "#d03b3b", "muted": "#898781"}
 
 STATUS_COLORS = {
@@ -15,6 +15,13 @@ STATUS_COLORS = {
     "Insufficient data": STATUS["muted"],
     "critical": STATUS["critical"], "warning": STATUS["warning"],
     "low_delivery": STATUS["muted"], "insufficient_history": INK["grid"], "healthy": STATUS["good"],
+}
+
+# Fixed per creative-type color, reused everywhere a creative_type is drawn —
+# never re-cycled by rank/filter. "Other" is deliberately muted (a catch-all).
+CREATIVE_TYPE_COLORS = {
+    "AI-generated": CAT["orange"], "KOL/UGC": CAT["blue"], "Feed / catalog": CAT["aqua"],
+    "Static image": CAT["violet"], "Video": CAT["yellow"], "Other": INK["muted"],
 }
 
 BASE_LAYOUT = dict(
@@ -74,6 +81,28 @@ def ad_roas_ctr_chart(days, roas, ctr, breakeven=1.0, benchmark=None):
                                line=dict(color=CAT["aqua"], width=2.5)))
     fig2.update_layout(**BASE_LAYOUT, title="Daily CTR", yaxis_title="CTR (%)", height=280)
     return fig, fig2
+
+
+def creative_spend_chart(creative_df, top_n=20):
+    d = creative_df.sort_values("spend", ascending=False).head(top_n).sort_values("spend")
+    colors = [CREATIVE_TYPE_COLORS.get(t, INK["muted"]) for t in d["creative_type"]]
+    fig = go.Figure(go.Bar(
+        x=d["spend"], y=d["creative_id"], orientation="h", marker_color=colors,
+        text=[f"{n} ad(s)" for n in d["n_ad_entries"]], textposition="outside",
+    ))
+    fig.update_layout(**BASE_LAYOUT, title=f"Top {min(top_n, len(d))} creatives by spend (re-uploads rolled up)",
+                       xaxis_title="Spend (USD)", height=max(320, 28 * len(d)))
+    return fig
+
+
+def creative_type_bar(by_type_df, metric, title, ytitle, fmt=None):
+    order = by_type_df.sort_values("spend", ascending=False)["creative_type"]
+    colors = [CREATIVE_TYPE_COLORS.get(t, INK["muted"]) for t in order]
+    fig = go.Figure(go.Bar(
+        x=order, y=by_type_df.set_index("creative_type").loc[order, metric], marker_color=colors,
+    ))
+    fig.update_layout(**BASE_LAYOUT, title=title, yaxis_title=ytitle, height=340, showlegend=False)
+    return fig
 
 
 def status_count_chart(status_counts, order, labels, colors):
