@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "meta-ads-checker",
+      "runtimeExecutable": "streamlit",
+      "runtimeArgs": ["run", "app.py", "--server.headless", "true", "--server.address", "127.0.0.1"],
+      "port": 8501
+    }
+  ]
+}

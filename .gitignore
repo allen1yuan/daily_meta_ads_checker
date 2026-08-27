@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# Real exports and generated output — never commit real account data
+*.csv
+!sample_data/*.csv
+daily_ad_check_*.csv
+
+# Real Meta exports dropped in for local testing (keep only the bundled synthetic sample)
+/data/
+*_export.xlsx
+!sample_data/sample_meta_ads_export.xlsx
