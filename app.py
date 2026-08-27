@@ -182,6 +182,27 @@ tab_campaign, tab_adset, tab_ad, tab_creative = st.tabs(
 # TAB 1 — Campaign
 # ---------------------------------------------------------------------------
 with tab_campaign:
+    with st.expander("ℹ️ How Scale / Maintain / Cut is decided"):
+        st.markdown(
+            "**Daily files** (this file): each campaign's window is split into an early half and a "
+            "late half by day count. Late-half ROAS is compared to *the campaign's own* early-half "
+            "ROAS, and to your benchmark:\n"
+            "- 🔴 **Cut** — late-half ROAS is below break-even, **or** ROAS fell more than 30% from "
+            "early to late window.\n"
+            "- 🟢 **Scale** — late-half ROAS is at/above the benchmark and not declining more than 5%.\n"
+            "- 🔵 **Maintain** — everything else (below benchmark but above break-even, not sharply falling).\n"
+            "- ⚪ **Insufficient data** — fewer than the minimum active days, or below the minimum "
+            "window spend, to trust a trend.\n\n"
+            "**Snapshot files** (no Day column): there's no trend to compare, so the same four labels "
+            "are assigned from the window's ROAS alone, versus break-even and the benchmark."
+            if hdg else
+            "**Snapshot files** (this file): there's no Day column, so no early/late trend can be "
+            "computed — each campaign is classified from its window ROAS alone:\n"
+            "- 🔴 **Cut** — ROAS below break-even.\n- 🟢 **Scale** — ROAS at/above the benchmark.\n"
+            "- 🔵 **Maintain** — in between.\n- ⚪ **Insufficient data** — below the minimum window spend.\n\n"
+            "**Daily files** (Day column present) additionally compare an early-half vs. late-half "
+            "ROAS trend, which isn't possible here."
+        )
     if hdg:
         st.subheader("Daily trend")
         daily_all = az.daily_rollup(df, [])
@@ -246,6 +267,17 @@ with tab_campaign:
 # TAB 2 — Ad set
 # ---------------------------------------------------------------------------
 with tab_adset:
+    with st.expander("ℹ️ How anomalies are flagged"):
+        st.markdown(
+            "Day-over-day **percent change** in CPC and CTR versus the previous active day — "
+            "deliberately not a z-score, since 3–7 days isn't enough to estimate a stable standard "
+            "deviation. Days under $5 spend are skipped as comparison points, so a jump from $1 to $3 "
+            "of spend doesn't register as a 'spike.'\n"
+            "- **CPC spike** — CPC rose more than the threshold (default +50%) vs. the prior day.\n"
+            "- **CTR drop** — CTR fell more than the threshold (default -40%) vs. the prior day.\n\n"
+            "Both thresholds are adjustable in the sidebar. This needs at least two comparable days per "
+            "ad set, so it's unavailable for single-window snapshot files (nothing to compare against)."
+        )
     st.subheader("Ad set performance")
     anomalies = az.detect_adset_anomalies(
         df, has_daily_granularity=hdg, cpc_spike_pct=cpc_spike_pct, ctr_drop_pct=ctr_drop_pct
@@ -322,6 +354,23 @@ with tab_adset:
 # TAB 3 — Ad
 # ---------------------------------------------------------------------------
 with tab_ad:
+    with st.expander("ℹ️ How ad status is decided"):
+        st.markdown(
+            "Checked in order — **data sufficiency before performance** — so a low-signal ad is never "
+            "mistaken for a genuinely bad one:\n"
+            "1. ⬜ **Insufficient history** — fewer than the minimum active days (daily files only; "
+            "skipped for snapshot files, since one aggregated row can't say how many days it covers).\n"
+            "2. ⚪ **Low delivery** — total window spend is below the minimum spend floor. The ROAS "
+            "number here is sampling noise, not a verdict — check delivery/budget, not the creative.\n"
+            "3. 🔴 **Critical** — ROAS is below break-even.\n"
+            "4. 🟠 **Warning** — ROAS is below the refresh-trigger fraction (default 70%) of the benchmark.\n"
+            "5. 🟢 **Healthy** — everything else.\n\n"
+            "**Daily files only**: `spend_trend_ratio` compares an ad's most recent day(s) of spend to "
+            "its own peak day in the window. When that ratio is low, delivery is winding down on its "
+            "own — a different problem (and a different fix) from a steady-spend ad that's genuinely "
+            "underperforming, so it's called out separately in the recommendation text rather than "
+            "folded into the ROAS number."
+        )
     st.subheader("Ad performance — fatigue and winners")
     st.caption(
         "Status is checked for **data sufficiency before performance**: an ad with too little spend this "
@@ -430,4 +479,49 @@ with tab_creative:
             "frequency": st.column_config.NumberColumn("Frequency", format="%.2f"),
             "impressions": None, "link_clicks": None, "reach": None,
         },
+    )
+
+    st.divider()
+    st.subheader("📐 Recommended ad naming template")
+    st.caption(
+        "Observed in the ad names actually in this account: creative-type tokens spelled several "
+        "ways (`Ai`/`AI`/`ai`, `image`/`Image`), dates in two formats (`20260811` vs `2.28`), the same "
+        "`#PIC#` tag reused across dozens of unrelated images (so it doesn't identify one creative), "
+        "and re-uploads stacked as `- 广告副本 - 广告副本 - 广告副本...` up to six times deep. None of "
+        "that breaks Meta, but all of it makes automated grouping (this app, or any future analysis) "
+        "guess instead of know. A single consistent template fixes all four at once."
+    )
+    st.markdown(
+        "```\n"
+        "{TYPE}-{PRODUCT}-#{TYPE}{SEQ}#-{YYYYMMDD}-{DESCRIPTOR}[-V{n}]\n"
+        "```"
+    )
+    naming_guide = pd.DataFrame([
+        {"Content type": "AI-generated", "TYPE code": "AI", "Example": "AI-LNV-#AI0057#-20260827-暮雨-秋季新品"},
+        {"Content type": "KOL / UGC", "TYPE code": "KOL", "Example": "KOL-LNV-#KOL0142#-20260827-claudia12xo"},
+        {"Content type": "Static image", "TYPE code": "IMG", "Example": "IMG-YZJ-#IMG0033#-20260827-产品图-V2"},
+        {"Content type": "Video (produced, non-AI/KOL)", "TYPE code": "VID", "Example": "VID-LNV-#VID0011#-20260827-开箱视频"},
+        {"Content type": "Feed / catalog", "TYPE code": "FEED", "Example": "FEED-LNV-DPA-Broad"},
+    ])
+    st.dataframe(naming_guide, use_container_width=True, hide_index=True)
+    st.markdown(
+        "- **`{TYPE}`** — always the first token, always one of the five fixed codes above (uppercase). "
+        "This is what `creative_type` classification keys off; a fixed vocabulary beats free text.\n"
+        "- **`{PRODUCT}`** — a short account/product code (e.g. `LNV` for LinenVibes, `YZJ`) — makes "
+        "the account filter and per-product rollups reliable without reading `Account name` separately.\n"
+        "- **`#{TYPE}{SEQ}#`** — the creative's permanent tag: type prefix + a zero-padded sequence "
+        "number, assigned **once** when the creative is first made. Reuse it only for a literal "
+        "re-upload of that exact asset — never for a different image/video that happens to share a "
+        "generic label like `#PIC#`. This is the single biggest lever: it's what makes the Creative "
+        "Rollup table above actually mean 'one row = one creative.'\n"
+        "- **`{YYYYMMDD}`** — one date format, always 8 digits, always the creative's original "
+        "creation date. (`2.28` and `20260228` both showed up in this account's history — pick one.)\n"
+        "- **`{DESCRIPTOR}`** — free text: model/creator name, concept, angle — whatever's useful to a "
+        "human scanning the list. Order and content don't matter to the app; only the fields before it do.\n"
+        "- **`[-V{n}]`** — only when re-entering the *identical* creative as a new ad-entry (a fresh "
+        "test, a reset after Meta's algorithm deprioritized it). Increment a single integer "
+        "(`-V2`, `-V3`) instead of stacking `- 广告副本` repeatedly — both this app and a human reading "
+        "the name can tell at a glance how many versions exist.\n\n"
+        "Feed/catalog ads are usually a standing, persistent ad rather than a one-off creative, so a "
+        "stable descriptive name (audience + purpose) matters more than a date/sequence there."
     )

@@ -87,6 +87,40 @@ No real ad data is bundled with this repo. `sample_data/sample_meta_ads_export.x
 synthetic (see `scripts/generate_sample_data.py`) — random names and numbers shaped like a real
 export, safe to publish.
 
+## Diagnosis logic, in the app
+
+Each tab has an **"ℹ️ How this is decided"** expander at the top with the exact rule being applied
+(Scale/Maintain/Cut, anomaly thresholds, ad status priority order) — open it before trusting a
+verdict on data you haven't seen this app work on before. The short version is in the "Why this
+isn't just compute ROAS and sort" section above; the in-app version is scoped to what that specific
+tab is doing.
+
+## Recommended ad naming template
+
+Tested against a real account's ad-name history, three things repeatedly break automated grouping
+(here and in any future analysis): creative-type tokens spelled inconsistently (`Ai`/`AI`/`ai`),
+dates in two formats (`20260811` vs `2.28`), and a generic tag (`#PIC#`) reused across dozens of
+unrelated images so it stops identifying one creative. A single template fixes all three:
+
+```
+{TYPE}-{PRODUCT}-#{TYPE}{SEQ}#-{YYYYMMDD}-{DESCRIPTOR}[-V{n}]
+```
+
+| Content type | `TYPE` | Example |
+|---|---|---|
+| AI-generated | `AI` | `AI-LNV-#AI0057#-20260827-暮雨-秋季新品` |
+| KOL / UGC | `KOL` | `KOL-LNV-#KOL0142#-20260827-claudia12xo` |
+| Static image | `IMG` | `IMG-YZJ-#IMG0033#-20260827-产品图-V2` |
+| Video (produced) | `VID` | `VID-LNV-#VID0011#-20260827-开箱视频` |
+| Feed / catalog | `FEED` | `FEED-LNV-DPA-Broad` (standing ad — no date/seq needed) |
+
+The load-bearing rule: **`#{TYPE}{SEQ}#` is assigned once per creative and only reused for a
+literal re-upload of that exact asset** — never for a different asset that happens to share a
+generic label. That single discipline is what makes "one row = one creative" true in the Creative
+Rollup tab. Re-uploads get a single incrementing `-V{n}` suffix instead of stacking `- 广告副本`
+repeatedly, so both the app and a human scanning the list can tell at a glance how many versions
+exist. Full rationale and per-type detail is in the app's Creative Rollup tab.
+
 ## Project layout
 
 ```
