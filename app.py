@@ -149,7 +149,9 @@ k5.metric("Purchases", f"{kpi['purchases']:,.0f}")
 
 st.divider()
 
-tab_campaign, tab_adset, tab_ad = st.tabs(["📊 Campaign Budget", "🎯 Ad Set Budget & Anomalies", "🎨 Ad Performance"])
+tab_campaign, tab_adset, tab_ad, tab_methodology = st.tabs(
+    ["📊 Campaign Budget", "🎯 Ad Set Budget & Anomalies", "🎨 Ad Performance", "📚 Methodology"]
+)
 
 
 def _rec_counts_row(rec_df):
@@ -267,8 +269,17 @@ with tab_adset:
     if method == "unavailable":
         st.info("No day-over-day data in this file (single-window snapshot) — nothing to compare.")
     elif method == "ml":
-        st.plotly_chart(ch.anomaly_scatter(pool), use_container_width=True)
-        st.caption(f"{int(pool['is_anomaly'].sum())} of {len(pool)} pooled ad-set-days flagged.")
+        latest_day = pool["day"].max()
+        pool_latest = pool[pool["day"] == latest_day]
+        st.plotly_chart(
+            ch.anomaly_scatter(pool_latest, title=f"Ad set anomaly detection — {latest_day.date()} (CTR vs. CPC)"),
+            use_container_width=True,
+        )
+        st.caption(
+            f"{int(pool_latest['is_anomaly'].sum())} of {len(pool_latest)} ad sets flagged for **{latest_day.date()}**. "
+            f"The model is fit on all {len(pool)} pooled ad-set-days in the loaded window so it knows each ad set's "
+            "normal range, but only the latest day is plotted — older, possibly-already-resolved anomalies aren't shown."
+        )
     elif len(anomalies):
         st.caption("Not enough pooled history yet for the anomaly model — showing simple day-over-day flags instead.")
         st.dataframe(
@@ -384,3 +395,129 @@ with tab_ad:
         ac1.plotly_chart(ch.daily_spend_chart(ad_daily), use_container_width=True)
         ac2.plotly_chart(fig_roas, use_container_width=True)
         ac3.plotly_chart(fig_ctr, use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# TAB 4 — Methodology: every algorithm/model behind the app, in one place,
+# with the thresholds currently in effect (from the sidebar) filled in.
+# ---------------------------------------------------------------------------
+with tab_methodology:
+    st.markdown(
+        "Everything below runs the same way for every file — nothing is hidden per-tab. Thresholds "
+        "shown are the ones **currently set in the sidebar**, so this reflects the exact run you're looking at."
+    )
+
+    st.subheader("1. Data shape detection")
+    st.markdown(
+        "On load, every column header is matched against known Meta export phrasings "
+        "(`analysis.py::COLUMN_ALIASES`) regardless of exact wording. A blank-hierarchy, "
+        "populated-spend row (the totals row Meta puts at the top of some exports) is detected and "
+        "excluded from every breakdown, then used only as a reconciliation check.\n\n"
+        "The file is then classified as one of two shapes, and every function below branches on it:\n"
+        "- **Daily** — a `Day` column with 2+ distinct dates. Enables everything trend-based.\n"
+        "- **Snapshot** — one row per ad over a single window. No trend is possible from one point, "
+        "so every level falls back to a threshold read on the window average instead."
+    )
+
+    st.subheader("2. Ratio-of-sums, never average-of-ratios")
+    st.markdown(
+        "ROAS, CTR, CPC, and CPM are **never** averaged directly across rows — that silently "
+        "misweights low-volume rows equally with high-volume ones. Every group (campaign, ad set, "
+        "ad, day) first sums the raw components (spend, revenue, impressions, clicks), then "
+        "recomputes the ratio from those sums (`analysis.py::add_ratio_columns`)."
+    )
+
+    st.subheader("3. Weighted linear regression — the trend algorithm")
+    st.markdown(
+        "Used identically at the campaign, ad set, and ad level (`analysis.py::weighted_roas_trend`). "
+        "For each entity, every available day's ROAS is fit with a **spend-weighted least-squares "
+        "line** (`numpy.polyfit`, weights = √(daily spend)) — not two arbitrary early/late buckets. "
+        "The fit's weighted **R²** is computed and used as a trust gate:\n\n"
+        f"- Needs **{min_active_days}+ active days** (your current *minimum active days* setting) and "
+        f"**R² ≥ {R2_THRESHOLD:.2f}** (fixed) to be trusted at all.\n"
+        "- A noisy or non-monotonic run of days (e.g. a mid-window dip that already recovered) "
+        "naturally scores low R² — no special-casing is needed for 'what if the most recent day "
+        "already turned around,' the gate handles it structurally.\n"
+        "- When trusted, the decision uses the **fitted end-of-window ROAS**. When not trusted, it "
+        "falls back to the **plain window-average ROAS** instead of an unreliable direction.\n"
+        "- Fitted values are clipped at 0 (a negative extrapolated ROAS is impossible and was an "
+        "early bug in this approach).\n\n"
+        "This is the **filled vs. hollow marker** you see on every quadrant chart: filled = trend "
+        "trusted and driving the call, hollow = too noisy, call rests on the ROAS level alone."
+    )
+
+    st.subheader("4. Budget allocation — Campaign & Ad set")
+    st.markdown(
+        f"Same function, same logic, applied at both grains (`analysis.py::classify_budget_level`). "
+        f"With your current sidebar values (benchmark **{benchmark_roas:.2f}x**, break-even "
+        f"**{breakeven_roas:.2f}x**, minimum window spend **${min_window_spend:,.0f}**, minimum "
+        f"active days **{min_active_days}**):\n\n"
+        "1. **Data sufficiency first** — below the minimum active days or minimum spend → "
+        "`⚪ Insufficient data`, never judged as good or bad.\n"
+        "2. Otherwise, `decision_level` = fitted end-of-window ROAS (if the trend is trusted) or "
+        "blended window ROAS (if not).\n"
+        f"3. **🔴 Cut** if blended ROAS or `decision_level` is below break-even "
+        f"({breakeven_roas:.2f}x).\n"
+        f"4. **🟢 Scale** if `decision_level` is at/above the benchmark ({benchmark_roas:.2f}x).\n"
+        "5. **🔵 Maintain** otherwise."
+    )
+
+    st.subheader("5. Ad set anomaly detection — the ML model")
+    st.markdown(
+        f"`analysis.py::detect_adset_anomalies`. Every ad-set-day is pooled together, then each "
+        "ad set's own **CTR and CPC are z-scored against its own history** (so 'unusual' means "
+        "unusual for that specific ad set, not just a bigger/smaller one in absolute terms). Those "
+        "two z-scores feed an **Isolation Forest** (`sklearn.ensemble.IsolationForest`, "
+        f"`n_estimators=200`, `contamination={anomaly_sensitivity:.2f}` — your current *anomaly "
+        "sensitivity* setting, `random_state=42` for reproducibility) fit across the pooled data — "
+        "catching e.g. 'CPC drifted up *and* CTR drifted down together' even when neither alone "
+        "crosses a hard threshold, which a per-metric rule can't see.\n\n"
+        "- Needs a pool of **30+ ad-set-days** (across all ad sets combined) for the model to be "
+        "meaningful. Below that it falls back to a simple **day-over-day % change rule** (CPC +50%, "
+        "or CTR -40%).\n"
+        "- Unavailable entirely for single-window snapshots (nothing to compare against).\n"
+        "- The model is trained on the **full pooled window**, but the chart only plots the "
+        "**latest day** — training needs multiple days per ad set to know what's normal, but the "
+        "actionable view is 'what's unusual right now,' not a history of anomalies that may have "
+        "already resolved."
+    )
+
+    st.subheader("6. Ad performance evaluation")
+    st.markdown(
+        f"`analysis.py::classify_ads`. Same weighted-regression trend as above, per ad, checked in "
+        "order — data sufficiency, then performance:\n\n"
+        f"1. ⬜ **Insufficient history** — fewer than {min_active_days} active day(s).\n"
+        f"2. ⚪ **Low delivery** — total spend under ${min_window_spend:,.0f}; ROAS here is sampling "
+        "noise, not signal.\n"
+        f"3. 🔴 **Critical** — ROAS (or a trusted trend) below break-even ({breakeven_roas:.2f}x).\n"
+        f"4. 🟠 **Warning** — trusted current level below {refresh_ratio:.0%} of benchmark "
+        f"({benchmark_roas * refresh_ratio:.2f}x) — your current *ad refresh trigger*.\n"
+        "5. 🟢 **Healthy** — everything else.\n\n"
+        "Alongside status, each ad also gets a **delivery-declining** flag — the most recent 1-2 "
+        "days' average spend compared against the ad's peak daily spend in the window — to separate "
+        "'this creative is underperforming' from 'this ad simply isn't being delivered anymore.' "
+        "`creative_type` is a lightweight keyword tag inferred from the ad's own name (Feed/catalog, "
+        "KOL/UGC, AI-generated, Static image, Video) — context for the ad-level view, not a "
+        "separate creative-level dataset or model."
+    )
+
+    st.subheader("7. Chart design choices")
+    st.markdown(
+        "- **Quadrant scatter** (Campaign/Ad set/Ad tabs) — x = ROAS (performance), y = fitted trend "
+        "slope in ROAS-x/day (potential/direction), bubble size = √spend, color = recommendation/"
+        "status, filled/hollow = trend confidence. This is deliberately the *one* chart each tab "
+        "leads with, not a table.\n"
+        "- **Percentile-clipped y-axis** — a trend fit from only 3-5 noisy days can occasionally "
+        "swing to an extreme slope value that would otherwise stretch the axis and flatten every "
+        "other point near zero. The axis is ranged to the 2nd-98th percentile of trend values "
+        "instead of the true min/max; the point itself still plots at its real value (visible on "
+        "hover), it just doesn't dictate the scale for everyone else.\n"
+        "- **Latest-day anomaly view** — see section 5 above."
+    )
+
+    st.subheader("Libraries")
+    st.markdown(
+        "`pandas`/`numpy` for data handling and the weighted regression, `scikit-learn` "
+        "(`IsolationForest`) for anomaly detection, `plotly` for every chart, `streamlit` for the UI. "
+        "All analysis logic lives in `analysis.py`, kept free of any Streamlit import so it can be "
+        "tested and reasoned about on its own."
+    )
