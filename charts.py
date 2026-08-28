@@ -1,6 +1,7 @@
-"""Plotly chart builders. Colors are fixed and consistent with the
-`status` semantics used throughout analysis.py — never re-cycled per plot."""
+"""Plotly chart builders. Minimalist, plot-first design: one high-value
+figure per question, status colors fixed and never re-cycled per plot."""
 
+import numpy as np
 import plotly.graph_objects as go
 
 INK = {
@@ -17,13 +18,6 @@ STATUS_COLORS = {
     "low_delivery": STATUS["muted"], "insufficient_history": INK["grid"], "healthy": STATUS["good"],
 }
 
-# Fixed per creative-type color, reused everywhere a creative_type is drawn —
-# never re-cycled by rank/filter. "Other" is deliberately muted (a catch-all).
-CREATIVE_TYPE_COLORS = {
-    "AI-generated": CAT["orange"], "KOL/UGC": CAT["blue"], "Feed / catalog": CAT["aqua"],
-    "Static image": CAT["violet"], "Video": CAT["yellow"], "Other": INK["muted"],
-}
-
 BASE_LAYOUT = dict(
     plot_bgcolor=INK["surface"], paper_bgcolor=INK["surface"],
     font=dict(color=INK["primary"], family="Helvetica Neue, Arial, sans-serif", size=13),
@@ -34,10 +28,35 @@ BASE_LAYOUT = dict(
 )
 
 
+def _robust_y_range(values, pad_frac=0.25, min_half_span=0.5):
+    """A trend slope fit from only 3-5 noisy days can occasionally swing to
+    an extreme value that would otherwise stretch the y-axis and flatten
+    every other point near zero — the same 'one outlier hides the trend'
+    problem as elsewhere in this project. Range the axis off the 2nd-98th
+    percentile instead of the true min/max; the point itself still plots
+    (and its real value is in the hover), it just doesn't dictate the scale."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) == 0:
+        return [-1, 1]
+    lo, hi = np.nanpercentile(v, [2, 98])
+    lo, hi = min(lo, 0), max(hi, 0)  # always include the zero reference line
+    half_span = max((hi - lo) / 2 * (1 + pad_frac), min_half_span)
+    mid = (hi + lo) / 2
+    return [mid - half_span, mid + half_span]
+
+
+def _sqrt_size(values, min_size=8, max_size=42):
+    v = np.clip(np.asarray(values, dtype=float), 0, None)
+    if v.max() <= 0:
+        return np.full_like(v, min_size)
+    return min_size + np.sqrt(v / v.max()) * (max_size - min_size)
+
+
 def daily_spend_chart(daily_df):
     fig = go.Figure()
     fig.add_bar(x=daily_df["day"], y=daily_df["spend"], marker_color=CAT["blue"], name="Spend")
-    fig.update_layout(**BASE_LAYOUT, title="Daily spend", yaxis_title="Spend (USD)", height=320)
+    fig.update_layout(**BASE_LAYOUT, title="Daily spend", yaxis_title="Spend (USD)", height=280)
     return fig
 
 
@@ -50,19 +69,140 @@ def daily_roas_chart(daily_df, breakeven=1.0, benchmark=None):
     if benchmark:
         fig.add_hline(y=benchmark, line_color=STATUS["good"], line_width=1, line_dash="dot",
                       annotation_text=f"{benchmark:.1f}x benchmark", annotation_position="right")
-    fig.update_layout(**BASE_LAYOUT, title="Daily ROAS", yaxis_title="ROAS (x)", height=320)
+    fig.update_layout(**BASE_LAYOUT, title="Daily ROAS", yaxis_title="ROAS (x)", height=280)
     return fig
 
 
-def campaign_recommendation_chart(camp_df):
-    d = camp_df.sort_values("spend")
+def budget_quadrant(df, entity_col, benchmark_roas, breakeven_roas, title, label_top_n=8):
+    """The primary budget-allocation visual: x = blended ROAS (performance),
+    y = fitted trend slope in ROAS-x/day (potential/direction), bubble size =
+    spend, color = recommendation. A filled marker means the trend was
+    confident enough to use; a hollow marker means the day-to-day pattern
+    was too noisy to fit a direction, so the recommendation rests on the
+    ROAS level alone. 'Insufficient data' rows are excluded (nothing
+    reliable to plot) — their count is reported by the caller separately."""
+    d = df[df["recommendation"] != "Insufficient data"].copy()
+    if d.empty:
+        return None
+    sizes = _sqrt_size(d["spend"])
+    colors = [STATUS_COLORS.get(r, INK["muted"]) for r in d["recommendation"]]
+    symbols = ["circle" if c else "circle-open" for c in d["trend_confident"]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=d["roas"], y=d["trend_slope"].fillna(0.0), mode="markers",
+        marker=dict(size=sizes, color=colors, symbol=symbols, line=dict(width=1.5, color=colors)),
+        customdata=np.stack([d[entity_col], d["spend"], d["roas"], d["trend_slope"].fillna(0.0)], axis=-1),
+        hovertemplate="<b>%{customdata[0]}</b><br>Spend $%{customdata[1]:,.0f}<br>ROAS %{customdata[2]:.2f}x"
+                      "<br>Trend %{customdata[3]:+.3f}x/day<extra></extra>",
+        showlegend=False,
+    ))
+    top = d.nlargest(label_top_n, "spend")
+    fig.add_trace(go.Scatter(
+        x=top["roas"], y=top["trend_slope"].fillna(0.0), mode="text",
+        text=[str(t)[:24] for t in top[entity_col]], textposition="top center",
+        textfont=dict(size=10, color=INK["secondary"]), showlegend=False,
+    ))
+    fig.add_vline(x=breakeven_roas, line_color=INK["baseline"], line_width=1,
+                  annotation_text="break-even", annotation_position="top")
+    fig.add_vline(x=benchmark_roas, line_color=STATUS["good"], line_width=1, line_dash="dot",
+                  annotation_text=f"{benchmark_roas:.1f}x benchmark", annotation_position="top")
+    fig.add_hline(y=0, line_color=INK["baseline"], line_width=1)
+
+    for rec, color in [("Scale", STATUS["good"]), ("Maintain", CAT["blue"]), ("Cut", STATUS["critical"])]:
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(size=10, color=color), name=rec))
+
+    fig.update_layout(**BASE_LAYOUT, title=title, xaxis_title="ROAS (performance)",
+                       yaxis_title="Trend, ROAS x/day (potential)", height=440)
+    fig.update_yaxes(range=_robust_y_range(d["trend_slope"]))
+    return fig
+
+
+def anomaly_scatter(pool_df, title="Ad set anomaly detection (CTR vs. CPC)"):
+    """Multivariate view of every pooled ad-set-day: x = CPC, y = CTR, sized
+    by spend, flagged points (from the Isolation Forest) in red."""
+    d = pool_df.copy()
+    sizes = _sqrt_size(d["spend"], min_size=6, max_size=30)
+    colors = [STATUS["critical"] if a else INK["muted"] for a in d["is_anomaly"]]
+    opacities = [0.9 if a else 0.45 for a in d["is_anomaly"]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=d["cpc"], y=d["ctr"], mode="markers",
+        marker=dict(size=sizes, color=colors, opacity=opacities, line=dict(width=0)),
+        customdata=np.stack([d["adset"], d["day"].dt.strftime("%Y-%m-%d"), d["spend"]], axis=-1),
+        hovertemplate="<b>%{customdata[0]}</b> (%{customdata[1]})<br>CPC $%{x:.2f}<br>CTR %{y:.2f}%"
+                      "<br>Spend $%{customdata[2]:,.0f}<extra></extra>",
+        showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(size=10, color=STATUS["critical"]), name="Flagged"))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(size=10, color=INK["muted"]), name="Normal"))
+    fig.update_layout(**BASE_LAYOUT, title=title, xaxis_title="CPC (USD)", yaxis_title="CTR (%)", height=420)
+    return fig
+
+
+def ad_performance_scatter(ads_df, benchmark_roas, breakeven_roas, title="Ad performance", label_top_n=6):
+    """Same quadrant language as the budget charts, at the ad grain: x =
+    ROAS, y = fitted trend slope, size = spend, color = status."""
+    d = ads_df[~ads_df["status"].isin(["insufficient_history", "low_delivery"])].copy()
+    if d.empty:
+        return None
+    sizes = _sqrt_size(d["spend"])
+    colors = [STATUS_COLORS.get(s, INK["muted"]) for s in d["status"]]
+    symbols = ["circle" if c else "circle-open" for c in d["trend_confident"]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=d["roas"], y=d["trend_slope"].fillna(0.0), mode="markers",
+        marker=dict(size=sizes, color=colors, symbol=symbols, line=dict(width=1.5, color=colors)),
+        customdata=np.stack([d["ad"], d["spend"], d["roas"], d["trend_slope"].fillna(0.0)], axis=-1),
+        hovertemplate="<b>%{customdata[0]}</b><br>Spend $%{customdata[1]:,.0f}<br>ROAS %{customdata[2]:.2f}x"
+                      "<br>Trend %{customdata[3]:+.3f}x/day<extra></extra>",
+        showlegend=False,
+    ))
+    top = d.nlargest(label_top_n, "spend")
+    fig.add_trace(go.Scatter(
+        x=top["roas"], y=top["trend_slope"].fillna(0.0), mode="text",
+        text=[str(t)[:20] for t in top["ad"]], textposition="top center",
+        textfont=dict(size=9, color=INK["secondary"]), showlegend=False,
+    ))
+    fig.add_vline(x=breakeven_roas, line_color=INK["baseline"], line_width=1, annotation_text="break-even")
+    fig.add_vline(x=benchmark_roas, line_color=STATUS["good"], line_width=1, line_dash="dot",
+                  annotation_text=f"{benchmark_roas:.1f}x benchmark")
+    fig.add_hline(y=0, line_color=INK["baseline"], line_width=1)
+
+    for label, color in [("Critical", STATUS["critical"]), ("Warning", STATUS["warning"]), ("Healthy", STATUS["good"])]:
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(size=10, color=color), name=label))
+
+    fig.update_layout(**BASE_LAYOUT, title=title, xaxis_title="ROAS (performance)",
+                       yaxis_title="Trend, ROAS x/day (potential)", height=440)
+    fig.update_yaxes(range=_robust_y_range(d["trend_slope"]))
+    return fig
+
+
+def budget_bar_snapshot(df, entity_col, title):
+    """Snapshot-mode fallback (no trend axis available): spend by entity,
+    colored by recommendation — still a plot, not a table."""
+    d = df[df["recommendation"] != "Insufficient data"].sort_values("spend").tail(20)
+    if d.empty:
+        return None
     colors = [STATUS_COLORS.get(r, INK["muted"]) for r in d["recommendation"]]
     fig = go.Figure(go.Bar(
-        x=d["spend"], y=d["campaign"], orientation="h", marker_color=colors,
-        text=[f"{r}" for r in d["recommendation"]], textposition="outside",
+        x=d["spend"], y=d[entity_col], orientation="h", marker_color=colors,
+        text=d["recommendation"], textposition="outside",
     ))
-    fig.update_layout(**BASE_LAYOUT, title="Spend by campaign, colored by recommendation",
-                       xaxis_title="Spend (USD)", height=max(280, 60 * len(d)))
+    fig.update_layout(**BASE_LAYOUT, title=title, xaxis_title="Spend (USD)",
+                       height=max(320, 28 * len(d)))
+    return fig
+
+
+def status_count_chart(status_counts, order, labels, colors):
+    fig = go.Figure(go.Bar(
+        x=[labels[s] for s in order], y=[status_counts.get(s, 0) for s in order],
+        marker_color=[colors[s] for s in order],
+        text=[status_counts.get(s, 0) for s in order], textposition="outside",
+    ))
+    fig.update_layout(**BASE_LAYOUT, title="Ad status breakdown", height=300, showlegend=False)
     return fig
 
 
@@ -74,42 +214,10 @@ def ad_roas_ctr_chart(days, roas, ctr, breakeven=1.0, benchmark=None):
     if benchmark:
         fig.add_hline(y=benchmark, line_color=STATUS["good"], line_width=1, line_dash="dot",
                       annotation_text=f"{benchmark:.1f}x benchmark")
-    fig.update_layout(**BASE_LAYOUT, title="Daily ROAS", yaxis_title="ROAS (x)", height=280)
+    fig.update_layout(**BASE_LAYOUT, title="Daily ROAS", yaxis_title="ROAS (x)", height=260)
 
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=days, y=ctr, mode="lines+markers", name="CTR",
                                line=dict(color=CAT["aqua"], width=2.5)))
-    fig2.update_layout(**BASE_LAYOUT, title="Daily CTR", yaxis_title="CTR (%)", height=280)
+    fig2.update_layout(**BASE_LAYOUT, title="Daily CTR", yaxis_title="CTR (%)", height=260)
     return fig, fig2
-
-
-def creative_spend_chart(creative_df, top_n=20):
-    d = creative_df.sort_values("spend", ascending=False).head(top_n).sort_values("spend")
-    colors = [CREATIVE_TYPE_COLORS.get(t, INK["muted"]) for t in d["creative_type"]]
-    fig = go.Figure(go.Bar(
-        x=d["spend"], y=d["creative_id"], orientation="h", marker_color=colors,
-        text=[f"{n} ad(s)" for n in d["n_ad_entries"]], textposition="outside",
-    ))
-    fig.update_layout(**BASE_LAYOUT, title=f"Top {min(top_n, len(d))} creatives by spend (re-uploads rolled up)",
-                       xaxis_title="Spend (USD)", height=max(320, 28 * len(d)))
-    return fig
-
-
-def creative_type_bar(by_type_df, metric, title, ytitle, fmt=None):
-    order = by_type_df.sort_values("spend", ascending=False)["creative_type"]
-    colors = [CREATIVE_TYPE_COLORS.get(t, INK["muted"]) for t in order]
-    fig = go.Figure(go.Bar(
-        x=order, y=by_type_df.set_index("creative_type").loc[order, metric], marker_color=colors,
-    ))
-    fig.update_layout(**BASE_LAYOUT, title=title, yaxis_title=ytitle, height=340, showlegend=False)
-    return fig
-
-
-def status_count_chart(status_counts, order, labels, colors):
-    fig = go.Figure(go.Bar(
-        x=[labels[s] for s in order], y=[status_counts.get(s, 0) for s in order],
-        marker_color=[colors[s] for s in order],
-        text=[status_counts.get(s, 0) for s in order], textposition="outside",
-    ))
-    fig.update_layout(**BASE_LAYOUT, title="Ad status breakdown", height=340, showlegend=False)
-    return fig

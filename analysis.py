@@ -4,36 +4,43 @@ Pure data-processing logic for the Meta Ads daily checker.
 Deliberately kept Streamlit-free so it can be tested and reasoned about on
 its own — `app.py` only calls into this module and draws the results.
 
+Scope: ads-level data only (Account / Campaign / Ad set / Ad). Two
+objectives: budget allocation at the Campaign and Ad set level, and granular
+performance evaluation of individual ads.
+
 Handles two shapes of Meta Ads Manager export:
 
-1. **Daily** — one row per (ad, day), 3-7 days of history. Enables trend-based
-   analysis: campaign Scale/Maintain/Cut from early-vs-late ROAS, ad-set
-   day-over-day CPC/CTR anomaly detection, ad-level ROAS/CTR sparklines.
+1. **Daily** — one row per (ad, day), 3+ days of history. Enables trend-based
+   analysis: a weighted-regression ROAS trend per campaign/ad set/ad, and
+   pooled multivariate anomaly detection across ad sets.
 2. **Snapshot** — one row per ad, aggregated over a single reporting window
-   (no Day column, or a Day/"Reporting starts" column with only one distinct
-   value). Common when Meta breaks an export out by Campaign/Ad set/Ad
-   without also adding a Day breakdown. Trend-based features aren't possible
-   from a single point, so this mode falls back to threshold-based
-   classification and says plainly where trend data is unavailable rather
-   than fabricating a trend from one number.
+   (no Day column, or only one distinct date). No trend is possible from one
+   point, so this mode falls back to threshold classification on the window
+   level and says plainly where trend data is unavailable.
 
 `load_and_standardize` detects which shape it's looking at and returns a
 `has_daily_granularity` flag; every downstream function takes that flag and
 adjusts what it computes accordingly.
 
 Core rules, applied consistently at every level (account / campaign / ad set
-/ ad / creative):
+/ ad):
 
 1. Ratios are always a ratio-of-sums, never an average-of-ratios. ROAS, CTR,
    CPC, and CPM are recomputed from summed raw components after grouping —
    never averaged directly, which would silently misweight low-volume rows.
 2. A verdict is only as good as the sample behind it. Every classification
    checks "is there enough spend/history to trust this number" *before* it
-   checks "is the number good or bad." An ad that spent $3 with zero
-   purchases is `low_delivery`, not `critical` — there is nothing reliable
-   to measure yet, and the fix (check delivery/budget) is different from the
-   fix for a steady-spend ad that is genuinely underperforming.
-3. A totals/summary row (every hierarchy column blank, metrics populated —
+   checks "is the number good or bad."
+3. A trend is only trusted when it's actually a good fit to the data, not
+   just whatever direction two arbitrary buckets happen to point. A
+   weighted linear regression (numpy, weighted by daily spend) is fit
+   through every available day; its R² gates whether the fitted trend
+   is used at all. A noisy, non-monotonic run of days (e.g. a dip that
+   already recovered) naturally gets a low R² and the classification
+   falls back to the plain window-average ROAS instead of an unreliable
+   direction — no special-casing needed for "what if the most recent day
+   already turned around," the confidence gate handles it structurally.
+4. A totals/summary row (every hierarchy column blank, metrics populated —
    the row Meta puts at the top of some exports) is detected and excluded
    from every breakdown automatically, and used only as a sanity check
    against the sum of the real rows.
@@ -41,7 +48,6 @@ Core rules, applied consistently at every level (account / campaign / ad set
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -102,17 +108,9 @@ class ColumnResolutionError(ValueError):
     pass
 
 
-# ---------------------------------------------------------------------------
-# Creative parsing — same conventions as the account's EDA notebook: a
-# `#TAG#`-delimited creative code is the most reliable id when present;
-# "variant" markers (广告副本 / "Copy") mark a re-upload of the same
-# underlying creative rather than a new one.
-# ---------------------------------------------------------------------------
-_VARIANT_PATTERN = re.compile(r"(\s*-\s*广告副本)|(\s*-\s*copy\b)", re.IGNORECASE)
-_TAG_PATTERN = re.compile(r"#([^#]+)#")
-
-
 def classify_creative_type(name: str) -> str:
+    """Lightweight content-type tag inferred from the ad name itself (not a
+    separate creative-level dataset) — useful context for the ad-level view."""
     s = name.lower()
     if "feed" in s or "目录" in name:
         return "Feed / catalog"
@@ -127,31 +125,6 @@ def classify_creative_type(name: str) -> str:
     return "Other"
 
 
-def extract_creative_tag(name: str) -> str | None:
-    m = _TAG_PATTERN.search(name)
-    return m.group(1).upper() if m else None
-
-
-def is_variant_name(name: str) -> bool:
-    return bool(_VARIANT_PATTERN.search(name))
-
-
-def base_creative_name(name: str) -> str:
-    """Strip repeated variant suffixes to approximate the underlying creative."""
-    prev = None
-    s = name
-    while prev != s:
-        prev = s
-        s = _VARIANT_PATTERN.sub("", s).strip()
-    return s or name
-
-
-def creative_id_for(name: str) -> str:
-    """Prefer the explicit #tag# code; fall back to the variant-stripped name."""
-    tag = extract_creative_tag(name)
-    return tag if tag else base_creative_name(name)
-
-
 @dataclass
 class LoadResult:
     df: pd.DataFrame
@@ -160,15 +133,15 @@ class LoadResult:
     has_daily_granularity: bool = True
     window_start: pd.Timestamp | None = None
     window_end: pd.Timestamp | None = None
-    totals_row_check: dict | None = None  # {"in_file": {...}, "computed": {...}, "matches": bool}
+    totals_row_check: dict | None = None
 
 
 def load_and_standardize(raw: pd.DataFrame) -> LoadResult:
     """
     Take a raw Meta Ads Manager export and return a standardized DataFrame
-    with canonical columns: day, account, campaign, adset, ad, creative_id,
-    creative_type, is_variant, spend, purchases, revenue, impressions,
-    link_clicks, cpm, cpc, ctr, frequency, reach.
+    with canonical columns: day, account, campaign, adset, ad, creative_type,
+    spend, purchases, revenue, impressions, link_clicks, cpm, cpc, ctr,
+    frequency, reach.
     """
     resolved = resolve_columns(raw)
     missing_required = [f for f in REQUIRED_LOGICAL_FIELDS if resolved[f] is None]
@@ -218,8 +191,8 @@ def load_and_standardize(raw: pd.DataFrame) -> LoadResult:
     if not has_daily_granularity:
         notes.append(
             "This file has only a single reporting date/window (no day-by-day breakdown) — trend-based "
-            "features (campaign trend, ad-set day-over-day anomalies, ad ROAS/CTR sparklines) aren't "
-            "available and are replaced with single-window equivalents."
+            "features (campaign/ad set trend, anomaly detection, ad ROAS/CTR history) aren't available "
+            "and are replaced with single-window equivalents."
         )
 
     window_start = pd.to_datetime(working[resolved["reporting_starts"]]).min() if resolved["reporting_starts"] else df["day"].min()
@@ -238,10 +211,7 @@ def load_and_standardize(raw: pd.DataFrame) -> LoadResult:
                 f"so every row is grouped under a single placeholder {label.lower()}."
             )
 
-    # --- Creative parsing (level 4: below individual ad-entries) -----------
     df["creative_type"] = df["ad"].apply(classify_creative_type)
-    df["is_variant"] = df["ad"].apply(is_variant_name)
-    df["creative_id"] = df["ad"].apply(creative_id_for)
 
     df["purchases"] = pd.to_numeric(working.get(resolved["purchases"]), errors="coerce").fillna(0.0) \
         if resolved["purchases"] else 0.0
@@ -314,161 +284,219 @@ def window_rollup(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Level 1 — Campaign: multi-day trend -> Scale / Maintain / Cut
-# (falls back to a single-window threshold read when there's no day-over-day
-# data to compute a trend from)
+# Weighted-regression trend — the core statistical upgrade. Used identically
+# at the campaign, ad set, and ad level so "potential" means the same thing
+# everywhere: a spend-weighted linear fit of daily ROAS across every
+# available day (not just two arbitrary buckets), gated by how good that fit
+# actually is (R²) before it's trusted for a decision.
 # ---------------------------------------------------------------------------
-def classify_campaigns(
+@dataclass
+class Trend:
+    n: int
+    slope_per_day: float = np.nan   # ROAS change per day, in x/day
+    r2: float = np.nan              # weighted goodness-of-fit, 0-1
+    fitted_start: float = np.nan    # fitted ROAS at the first day (>= 0, clipped)
+    fitted_end: float = np.nan      # fitted ROAS at the last day (>= 0, clipped)
+    confident: bool = False
+
+
+def weighted_roas_trend(days: pd.Series, roas: pd.Series, weights: pd.Series,
+                         min_points: int = 4, r2_threshold: float = 0.35) -> Trend:
+    days = pd.to_datetime(pd.Series(days))
+    roas = pd.Series(roas).to_numpy(dtype=float)
+    weights = pd.Series(weights).to_numpy(dtype=float)
+    mask = np.isfinite(roas) & np.isfinite(weights) & (weights >= 0)
+    roas, weights = roas[mask], weights[mask]
+    day_idx = (days[mask] - days[mask].min()).dt.days.to_numpy(dtype=float)
+    n = len(roas)
+    if n < 3 or weights.sum() <= 0:
+        return Trend(n=n)
+
+    w = np.sqrt(weights)
+    coeffs = np.polyfit(day_idx, roas, deg=1, w=w)
+    pred = np.polyval(coeffs, day_idx)
+    wmean = np.average(roas, weights=weights)
+    ss_tot = np.sum(weights * (roas - wmean) ** 2)
+    ss_res = np.sum(weights * (roas - pred) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    fitted_start = max(0.0, float(np.polyval(coeffs, day_idx.min())))
+    fitted_end = max(0.0, float(np.polyval(coeffs, day_idx.max())))
+    confident = n >= min_points and r2 >= r2_threshold
+
+    return Trend(n=n, slope_per_day=float(coeffs[0]), r2=float(r2),
+                 fitted_start=fitted_start, fitted_end=fitted_end, confident=confident)
+
+
+# ---------------------------------------------------------------------------
+# Budget allocation — Campaign AND Ad set (same function, different grain).
+# Falls back to a single-window threshold read when there's no day-over-day
+# data to fit a trend from.
+# ---------------------------------------------------------------------------
+def classify_budget_level(
     df: pd.DataFrame,
+    level_col: str,
     benchmark_roas: float,
     has_daily_granularity: bool = True,
     breakeven_roas: float = 1.0,
     min_window_spend: float = 15.0,
-    min_active_days: int = 2,
-    cut_decline_pct: float = 0.30,
+    min_active_days: int = 3,
+    r2_threshold: float = 0.35,
 ) -> pd.DataFrame:
     rows = []
-    for camp, g in df.groupby("campaign"):
+    for entity, g in df.groupby(level_col):
         g = g.sort_values("day")
-        days = sorted(g["day"].unique())
-        n = len(days)
+        n_days = g["day"].nunique()
         total_spend = g["spend"].sum()
         total_revenue = g["revenue"].sum()
         overall_roas = total_revenue / total_spend if total_spend > 0 else np.nan
         overall_cpa = total_spend / g["purchases"].sum() if g["purchases"].sum() > 0 else np.nan
 
-        day_gate_ok = n >= min_active_days if has_daily_granularity else True
+        base_row = {
+            level_col: entity, "active_days": n_days, "spend": total_spend, "revenue": total_revenue,
+            "roas": overall_roas, "cpa": overall_cpa, "trend_slope": np.nan, "trend_r2": np.nan,
+            "trend_confident": False, "decision_level": np.nan,
+        }
+
+        day_gate_ok = n_days >= min_active_days if has_daily_granularity else True
         if not day_gate_ok or total_spend < min_window_spend:
-            rows.append({
-                "campaign": camp, "active_days": n, "spend": total_spend, "revenue": total_revenue,
-                "roas": overall_roas, "cpa": overall_cpa, "early_roas": np.nan, "late_roas": np.nan,
-                "trend_pct": np.nan, "latest_day_roas": np.nan, "recommendation": "Insufficient data",
-                "rationale": f"Only {n} day(s) / ${total_spend:.0f} spend in this window — not enough to judge.",
-            })
+            rows.append({**base_row, "recommendation": "Insufficient data",
+                         "rationale": f"Only {n_days} day(s) / ${total_spend:.0f} spend — not enough to judge."})
             continue
 
         if not has_daily_granularity:
-            # Single-window snapshot: no trend possible, judge on the level alone.
             if overall_roas < breakeven_roas:
                 rec, why = "Cut", f"ROAS {overall_roas:.2f}x is below break-even (single-window snapshot — no trend available)."
             elif overall_roas >= benchmark_roas:
                 rec, why = "Scale", f"ROAS {overall_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark (single-window snapshot — no trend available)."
             else:
                 rec, why = "Maintain", f"ROAS {overall_roas:.2f}x is between break-even and benchmark (single-window snapshot — no trend available)."
-            rows.append({
-                "campaign": camp, "active_days": n, "spend": total_spend, "revenue": total_revenue,
-                "roas": overall_roas, "cpa": overall_cpa, "early_roas": np.nan, "late_roas": np.nan,
-                "trend_pct": np.nan, "latest_day_roas": np.nan, "recommendation": rec, "rationale": why,
-            })
+            rows.append({**base_row, "decision_level": overall_roas, "recommendation": rec, "rationale": why})
             continue
 
-        half = max(1, n // 2)
-        early_days, late_days = days[:half], days[half:]
-        early = g[g["day"].isin(early_days)]
-        late = g[g["day"].isin(late_days)]
-        early_roas = early["revenue"].sum() / early["spend"].sum() if early["spend"].sum() > 0 else np.nan
-        late_roas = late["revenue"].sum() / late["spend"].sum() if late["spend"].sum() > 0 else np.nan
-        trend_pct = (late_roas - early_roas) / early_roas if (pd.notna(early_roas) and early_roas > 0) else np.nan
+        daily = g.groupby("day")[["spend", "revenue"]].sum()
+        daily_roas = daily["revenue"] / daily["spend"].replace(0, np.nan)
+        trend = weighted_roas_trend(daily.index.to_series(), daily_roas, daily["spend"], r2_threshold=r2_threshold)
 
-        # The "late half" can span several days (e.g. a 3-of-5 split), so its
-        # average can bury a genuine turnaround on the single most recent day —
-        # a campaign that dipped mid-window and already recovered today would
-        # otherwise read as "declining." The most recent day alone (only once
-        # it clears a minimum spend, so a few noisy dollars can't swing it) is
-        # tracked separately and can pull an otherwise trend-triggered Cut back
-        # to Maintain, without weakening the Cut rule for a campaign that's
-        # actually still below break-even in aggregate.
-        latest_day = days[-1]
-        latest = g[g["day"] == latest_day]
-        latest_spend = latest["spend"].sum()
-        latest_day_roas = (latest["revenue"].sum() / latest_spend
-                            if latest_spend >= min(5.0, min_window_spend) else np.nan)
+        decision_level = trend.fitted_end if trend.confident else overall_roas
 
-        trend_triggered_cut = late_roas >= breakeven_roas and pd.notna(trend_pct) and trend_pct <= -cut_decline_pct
-        recovered_today = pd.notna(latest_day_roas) and latest_day_roas >= benchmark_roas
-
-        if late_roas < breakeven_roas:
+        if overall_roas < breakeven_roas or decision_level < breakeven_roas:
             rec = "Cut"
-            why = f"Late-window ROAS {late_roas:.2f}x is below break-even."
-        elif trend_triggered_cut and recovered_today:
-            rec = "Maintain"
-            why = (f"ROAS fell {abs(trend_pct):.0%} from early to late window ({early_roas:.2f}x -> {late_roas:.2f}x) "
-                   f"averaged across the late window, but the most recent day ({latest_day.date()}) already recovered "
-                   f"to {latest_day_roas:.2f}x — worth monitoring rather than cutting immediately.")
-        elif trend_triggered_cut:
-            rec = "Cut"
-            why = f"ROAS fell {abs(trend_pct):.0%} from early to late window ({early_roas:.2f}x -> {late_roas:.2f}x)."
-        elif late_roas >= benchmark_roas and (pd.isna(trend_pct) or trend_pct >= -0.05):
+            if trend.confident:
+                why = (f"Blended ROAS {overall_roas:.2f}x, and the fitted trend across all {trend.n} days is "
+                       f"confidently declining (R²={trend.r2:.2f}) toward {trend.fitted_end:.2f}x — projected below break-even.")
+            else:
+                why = f"Blended ROAS {overall_roas:.2f}x is below break-even."
+        elif decision_level >= benchmark_roas:
             rec = "Scale"
-            why = f"Late-window ROAS {late_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark and holding or rising."
+            if trend.confident:
+                why = (f"Fitted trend across all {trend.n} days is confidently rising (R²={trend.r2:.2f}, "
+                       f"{trend.fitted_start:.2f}x -> {trend.fitted_end:.2f}x) and at/above the {benchmark_roas:.1f}x benchmark.")
+            else:
+                why = (f"Blended ROAS {overall_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark; the day-to-day "
+                       f"pattern is too noisy to fit a confident trend (R²={trend.r2:.2f}), so this is based on the "
+                       "window average, not a direction.")
         else:
             rec = "Maintain"
-            why = f"Late-window ROAS {late_roas:.2f}x is below benchmark but above break-even and not sharply declining."
+            if trend.confident:
+                why = (f"Fitted trend across all {trend.n} days (R²={trend.r2:.2f}) puts current ROAS around "
+                       f"{trend.fitted_end:.2f}x — between break-even and the {benchmark_roas:.1f}x benchmark.")
+            else:
+                why = (f"Blended ROAS {overall_roas:.2f}x is between break-even and benchmark; the day-to-day pattern "
+                       f"is too noisy to fit a confident trend (R²={trend.r2:.2f}), so this is based on the window "
+                       "average, not a direction.")
 
         rows.append({
-            "campaign": camp, "active_days": n, "spend": total_spend, "revenue": total_revenue,
-            "roas": overall_roas, "cpa": overall_cpa, "early_roas": early_roas, "late_roas": late_roas,
-            "trend_pct": trend_pct, "latest_day_roas": latest_day_roas, "recommendation": rec, "rationale": why,
+            **base_row, "trend_slope": trend.slope_per_day, "trend_r2": trend.r2,
+            "trend_confident": trend.confident, "decision_level": decision_level,
+            "recommendation": rec, "rationale": why,
         })
     return pd.DataFrame(rows).sort_values("spend", ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Level 2 — Ad set: performance + day-over-day anomaly flags
+# Ad set anomaly detection — pooled multivariate outlier model (Isolation
+# Forest) across every ad-set-day, z-scored within each ad set first (so
+# "unusual" means unusual FOR THAT ad set, not just a bigger one). Falls
+# back to a simple day-over-day percent-change rule when there isn't enough
+# pooled data for a model to be meaningful, or no daily granularity at all.
 # ---------------------------------------------------------------------------
 def detect_adset_anomalies(
     df: pd.DataFrame,
     has_daily_granularity: bool = True,
-    cpc_spike_pct: float = 0.50,
-    ctr_drop_pct: float = 0.40,
     min_day_spend: float = 5.0,
-) -> pd.DataFrame:
-    """
-    Day-over-day percent change in CPC and CTR per ad set. With only 3-7
-    days per ad set a z-score is unstable (too few points to estimate a
-    standard deviation), so this uses a direct percent-change threshold
-    against the *previous* active day instead. Returns an empty frame
-    (nothing to compare) when the file has no day-over-day granularity.
-    """
+    contamination: float = 0.08,
+    min_rows_for_ml: int = 30,
+    min_days_per_adset: int = 3,
+) -> tuple[pd.DataFrame, str, pd.DataFrame | None]:
+    """Returns (flags_df, method, scored_pool). method is 'ml', 'heuristic', or
+    'unavailable'. scored_pool (only set for 'ml') carries every pooled
+    ad-set-day with its z-scores and anomaly flag, for the scatter chart —
+    not just the flagged rows, so the chart can show normal points too."""
     if not has_daily_granularity:
-        return pd.DataFrame(columns=["adset", "day", "type", "detail"])
+        return pd.DataFrame(columns=["adset", "day", "type", "detail", "score"]), "unavailable", None
 
     daily = daily_rollup(df, ["adset"])
+    daily = daily[daily["spend"] >= min_day_spend].copy()
+
+    eligible = daily.groupby("adset")["day"].transform("count") >= min_days_per_adset
+    pool = daily[eligible].copy()
+
+    if len(pool) >= min_rows_for_ml:
+        from sklearn.ensemble import IsolationForest
+
+        pool["z_ctr"] = pool.groupby("adset")["ctr"].transform(lambda s: (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) > 0 else 0.0)
+        pool["z_cpc"] = pool.groupby("adset")["cpc"].transform(lambda s: (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) > 0 else 0.0)
+        features = pool[["z_ctr", "z_cpc"]].fillna(0.0)
+
+        model = IsolationForest(n_estimators=200, contamination=contamination, random_state=42)
+        raw_labels = model.fit_predict(features)  # -1 = anomaly, 1 = normal
+        pool["is_anomaly"] = raw_labels == -1
+        pool["score"] = -model.score_samples(features)  # higher = more anomalous
+
+        flagged = pool[pool["is_anomaly"]].copy()
+        flags = []
+        for _, r in flagged.iterrows():
+            reasons = []
+            if abs(r["z_ctr"]) >= 1.0:
+                reasons.append(f"CTR {r['z_ctr']:+.1f}σ vs. this ad set's own average ({r['ctr']:.2f}%)")
+            if abs(r["z_cpc"]) >= 1.0:
+                reasons.append(f"CPC {r['z_cpc']:+.1f}σ vs. this ad set's own average (${r['cpc']:.2f})")
+            if not reasons:
+                reasons.append(f"CTR {r['ctr']:.2f}%, CPC ${r['cpc']:.2f} — unusual combination for this ad set")
+            flags.append({"adset": r["adset"], "day": r["day"], "type": "Anomaly",
+                          "detail": "; ".join(reasons), "score": r["score"]})
+        return pd.DataFrame(flags), "ml", pool
+
+    # Fallback: day-over-day percent change, too little pooled data for ML to be meaningful.
     flags = []
     for adset, g in daily.groupby("adset"):
         g = g.sort_values("day").reset_index(drop=True)
-        g = g[g["spend"] >= min_day_spend]
         if len(g) < 2:
             continue
         g["cpc_pct_change"] = g["cpc"].pct_change()
         g["ctr_pct_change"] = g["ctr"].pct_change()
-        cpc_spikes = g[g["cpc_pct_change"] > cpc_spike_pct]
-        ctr_drops = g[g["ctr_pct_change"] < -ctr_drop_pct]
-        for _, r in cpc_spikes.iterrows():
+        for _, r in g[g["cpc_pct_change"] > 0.5].iterrows():
             flags.append({"adset": adset, "day": r["day"], "type": "CPC spike",
-                          "detail": f"CPC +{r['cpc_pct_change']:.0%} to ${r['cpc']:.2f}"})
-        for _, r in ctr_drops.iterrows():
+                          "detail": f"CPC +{r['cpc_pct_change']:.0%} to ${r['cpc']:.2f}", "score": np.nan})
+        for _, r in g[g["ctr_pct_change"] < -0.4].iterrows():
             flags.append({"adset": adset, "day": r["day"], "type": "CTR drop",
-                          "detail": f"CTR {r['ctr_pct_change']:.0%} to {r['ctr']:.2f}%"})
-    return pd.DataFrame(flags)
+                          "detail": f"CTR {r['ctr_pct_change']:.0%} to {r['ctr']:.2f}%", "score": np.nan})
+    return pd.DataFrame(flags), "heuristic", None
 
 
 def adset_summary(df: pd.DataFrame, anomalies: pd.DataFrame) -> pd.DataFrame:
     summary = window_rollup(df, ["adset"])
     if len(anomalies):
         counts = anomalies.groupby("adset").size().rename("anomaly_count")
-        types = anomalies.groupby("adset")["type"].apply(lambda s: ", ".join(sorted(set(s)))).rename("anomaly_types")
-        summary = summary.merge(counts, on="adset", how="left").merge(types, on="adset", how="left")
+        summary = summary.merge(counts, on="adset", how="left")
     else:
         summary["anomaly_count"] = 0
-        summary["anomaly_types"] = ""
     summary["anomaly_count"] = summary["anomaly_count"].fillna(0).astype(int)
-    summary["anomaly_types"] = summary["anomaly_types"].fillna("")
     return summary.sort_values("spend", ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Level 3 — Ad: creative fatigue / winner table
+# Ad: granular performance evaluation
 # ---------------------------------------------------------------------------
 def classify_ads(
     df: pd.DataFrame,
@@ -480,11 +508,11 @@ def classify_ads(
     refresh_ratio: float = 0.7,
     declining_spend_ratio: float = 0.3,
     declining_lookback: int = 2,
+    r2_threshold: float = 0.35,
 ) -> pd.DataFrame:
-    """Per-ad rollup + status classification. Day-based signals (spend-trend,
-    ROAS/CTR sparklines) are only computed when the file has day-over-day
-    granularity; in snapshot mode the active-days gate is skipped too, since
-    a single aggregated row can't tell us how many distinct days it covers."""
+    """Per-ad rollup + status classification. Data sufficiency is checked
+    before performance: an ad with too little history or spend is flagged
+    as such, not judged as good or bad."""
     rows = []
     for ad, g in df.groupby("ad"):
         g = g.sort_values("day")
@@ -493,19 +521,20 @@ def classify_ads(
         total_revenue = g["revenue"].sum()
         roas = total_revenue / total_spend if total_spend > 0 else np.nan
 
+        trend = Trend(n=0)
         if has_daily_granularity:
-            peak_daily_spend = g.groupby("day")["spend"].sum().max()
-            daily_spend = g.groupby("day")["spend"].sum().sort_index()
-            recent = daily_spend.tail(min(declining_lookback, len(daily_spend)))
+            daily = g.groupby("day")[["spend", "revenue"]].sum()
+            daily_roas = daily["revenue"] / daily["spend"].replace(0, np.nan)
+            trend = weighted_roas_trend(daily.index.to_series(), daily_roas, daily["spend"], r2_threshold=r2_threshold)
+
+            peak_daily_spend = daily["spend"].max()
+            recent = daily["spend"].sort_index().tail(min(declining_lookback, len(daily)))
             spend_trend_ratio = recent.mean() / peak_daily_spend if peak_daily_spend > 0 else np.nan
             delivery_declining = bool(pd.notna(spend_trend_ratio) and spend_trend_ratio < declining_spend_ratio)
-            daily_ctr = daily_rollup(g, ["ad"]).sort_values("day")
-            ctr_trend = daily_ctr["ctr"].fillna(0).tolist()
-            roas_trend = daily_ctr["roas"].fillna(0).tolist()
-            spend_trend = daily_ctr["spend"].fillna(0).tolist()
         else:
             spend_trend_ratio, delivery_declining = np.nan, False
-            ctr_trend, roas_trend, spend_trend = [], [], []
+
+        decision_level = trend.fitted_end if trend.confident else roas
 
         day_gate_ok = active_days >= min_active_days if has_daily_granularity else True
         if not day_gate_ok:
@@ -513,42 +542,31 @@ def classify_ads(
         elif total_spend < min_window_spend:
             note = " Delivery is also actively declining." if delivery_declining else ""
             status, rec = "low_delivery", f"Check delivery/budget, not creative — only ${total_spend:.0f} spent.{note}"
-        elif roas < breakeven_roas:
+        elif roas < breakeven_roas or decision_level < breakeven_roas:
             note = " (delivery is also collapsing on its own)" if delivery_declining else ""
-            status, rec = "critical", f"Refresh or pause — {roas:.2f}x, below break-even{note}."
-        elif roas < benchmark_roas * refresh_ratio:
+            if trend.confident:
+                rec_txt = f"Refresh or pause — {roas:.2f}x blended, trend confidently declining toward {trend.fitted_end:.2f}x{note}."
+            else:
+                rec_txt = f"Refresh or pause — {roas:.2f}x, below break-even{note}."
+            status, rec = "critical", rec_txt
+        elif decision_level < benchmark_roas * refresh_ratio:
             note = " Delivery is also declining." if delivery_declining else ""
             status, rec = "warning", f"Watch closely — {roas:.2f}x, under {refresh_ratio:.0%} of benchmark.{note}"
         else:
             status, rec = "healthy", f"Healthy — {roas:.2f}x."
 
         rows.append({
-            "ad": ad, "creative_type": g["creative_type"].iloc[0], "is_variant": bool(g["is_variant"].iloc[0]),
+            "ad": ad, "creative_type": g["creative_type"].iloc[0],
             "active_days": active_days, "spend": total_spend, "revenue": total_revenue,
-            "roas": roas, "spend_trend_ratio": spend_trend_ratio, "delivery_declining": delivery_declining,
-            "status": status, "recommendation": rec,
-            "ctr_trend": ctr_trend, "roas_trend": roas_trend, "spend_trend": spend_trend,
+            "roas": roas, "trend_slope": trend.slope_per_day, "trend_r2": trend.r2,
+            "trend_confident": trend.confident, "spend_trend_ratio": spend_trend_ratio,
+            "delivery_declining": delivery_declining, "status": status, "recommendation": rec,
         })
 
     out = pd.DataFrame(rows)
     status_order = {"critical": 0, "warning": 1, "low_delivery": 2, "insufficient_history": 3, "healthy": 4}
     out["_order"] = out["status"].map(status_order)
     return out.sort_values(["_order", "spend"], ascending=[True, False]).drop(columns="_order").reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# Level 4 — Creative: roll re-uploaded/duplicated ad-entries up to the
-# underlying creative concept, independent of how many times it was re-run.
-# ---------------------------------------------------------------------------
-def creative_rollup(df: pd.DataFrame) -> pd.DataFrame:
-    g = df.groupby("creative_id", as_index=False).agg(
-        **{c: (c, "sum") for c in SUM_COLS},
-        creative_type=("creative_type", "first"),
-        n_ad_entries=("ad", "nunique"),
-        n_variants=("is_variant", "sum"),
-    )
-    g = add_ratio_columns(g)
-    return g.sort_values("spend", ascending=False).reset_index(drop=True)
 
 
 def topline_kpis(df: pd.DataFrame) -> dict:
