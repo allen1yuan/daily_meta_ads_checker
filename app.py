@@ -180,20 +180,51 @@ TREND_METHOD_MD = (
 with tab_hierarchy:
     with st.expander("ℹ️ How to read this"):
         st.markdown(
-            "**Total** splits into two mirrored branches — **Spend** (where the budget went) and "
-            "**Conversion value** (where the revenue came from) — each fanning out through the same "
-            "**Campaign → Ad set → Ad** hierarchy, so you can compare 'what did we spend on' against "
-            "'what actually paid off' side by side.\n\n"
-            "Box size = spend (left branch) or conversion value (right branch) at that level. Color = "
-            "that node's *own* window ROAS against your Cut / Maintain / Scale thresholds — same rule "
-            "as the other tabs, just window-level (no trend) since this view spans every level at once.\n\n"
-            "Only 3 levels render at first for a clean view — **click any wedge to drill into it** "
-            "(Campaign → Ad set → Ad), and click the center **Total** ring to zoom back out. Hover any "
-            "node — including individual ads — for its full metrics (spend, revenue, ROAS, CPA, CTR, CPC)."
+            "A top-down mind map, one level at a time: the top node is the parent, each node below it "
+            "is a direct child, sized by spend. Color = that node's *own* window ROAS against your "
+            "Cut / Maintain / Scale thresholds (🟢 Scale · 🔵 Maintain · 🔴 Cut · ⚪ Insufficient data) — "
+            "window-level, not a trend, since this spans every level of the account. Hover any node "
+            "for its full metrics.\n\n"
+            "**Pick a campaign** below to fan out its ad sets, then **pick an ad set** to fan out its "
+            "individual ads — CPA/CTR/CPC show on hover at that level."
         )
 
-    tree_df = az.hierarchy_tree(df, benchmark_roas=benchmark_roas, breakeven_roas=breakeven_roas)
-    st.plotly_chart(ch.hierarchy_icicle(tree_df), use_container_width=True)
+    def _bucketed(roll):
+        roll = roll.copy()
+        roll["bucket"] = roll["roas"].apply(lambda r: az.roas_bucket(r, benchmark_roas, breakeven_roas))
+        return roll.sort_values("spend", ascending=False)
+
+    hier_camp_roll = _bucketed(az.window_rollup(df, ["campaign"]).rename(columns={"campaign": "label"}))
+    fig = ch.mind_map_level("Total", kpi, hier_camp_roll, "Total → Campaigns")
+    if fig is not None:
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No campaigns with data to plot.")
+
+    hier_pick_campaign = st.selectbox("Drill into a campaign", hier_camp_roll["label"].tolist())
+
+    hier_camp_df = df[df["campaign"] == hier_pick_campaign]
+    hier_camp_row = hier_camp_roll.loc[hier_camp_roll["label"] == hier_pick_campaign].iloc[0]
+    hier_adset_roll = _bucketed(az.window_rollup(hier_camp_df, ["adset"]).rename(columns={"adset": "label"}))
+    fig2 = ch.mind_map_level(hier_pick_campaign, hier_camp_row, hier_adset_roll, f"{hier_pick_campaign} → Ad sets")
+    if fig2 is not None:
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info("No ad sets under this campaign with data to plot.")
+        hier_adset_roll = None
+
+    if hier_adset_roll is not None:
+        hier_pick_adset = st.selectbox(
+            f"Drill into an ad set (within '{hier_pick_campaign}')", hier_adset_roll["label"].tolist()
+        )
+        hier_adset_df = hier_camp_df[hier_camp_df["adset"] == hier_pick_adset]
+        hier_adset_row = hier_adset_roll.loc[hier_adset_roll["label"] == hier_pick_adset].iloc[0]
+        hier_ad_roll = _bucketed(az.window_rollup(hier_adset_df, ["ad"]).rename(columns={"ad": "label"}))
+        fig3 = ch.mind_map_level(hier_pick_adset, hier_adset_row, hier_ad_roll, f"{hier_pick_adset} → Ads")
+        if fig3 is not None:
+            st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.info("No ads under this ad set with data to plot.")
 
 # ---------------------------------------------------------------------------
 # TAB 1 — Campaign budget
@@ -523,14 +554,16 @@ with tab_methodology:
 
     st.subheader("7. Hierarchy view")
     st.markdown(
-        "`analysis.py::hierarchy_tree` builds one node per (branch, campaign / ad set / ad) — no "
-        "model here, just a window-level rollup at every grain simultaneously. **Total** has two "
-        "children, **Spend** and **Conversion value**, each independently summing down through "
-        "Campaign → Ad set → Ad (so a campaign's box under Spend and its box under Conversion value "
-        "can be different sizes — that gap *is* the insight). Each node's color bucket "
-        "(Cut/Maintain/Scale) uses its own window ROAS against the same break-even/benchmark "
-        "thresholds as the budget tabs — window-level only, no trend, since this view spans every "
-        "level of the account at once rather than one grain at a time."
+        "No model here — `charts.py::mind_map_level` renders one 'star' at a time (one parent, its "
+        "direct children below it, connected by lines), built from the same `window_rollup` used "
+        "elsewhere. Total → Campaigns renders first; picking a campaign renders a second star for its "
+        "Ad sets, and picking an ad set renders a third for its Ads. Kept to one small star per view, "
+        "rather than every level at once, on purpose — an earlier all-at-once version (a nested-box "
+        "'icicle' chart with the whole account rendered simultaneously) was hard to read at real "
+        "account scale and had a rendering bug where its legend overlapped the title. Node size = "
+        "spend; color = that node's own window ROAS against the break-even/benchmark thresholds "
+        "(`analysis.py::roas_bucket`) — window-level only, no trend, since a single star spans "
+        "several entities of the same type at once rather than one entity's history."
     )
 
     st.subheader("8. Chart design choices")

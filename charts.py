@@ -181,45 +181,70 @@ def ad_performance_scatter(ads_df, benchmark_roas, breakeven_roas, title="Ad per
     return fig
 
 
-def hierarchy_icicle(tree_df, title="Total → Spend / Conversion value → Campaign → Ad set → Ad"):
-    """The whole account as one drill-down pyramid: Total splits into two
-    mirrored branches (Spend, Conversion value), each fanning out through
-    Campaign -> Ad set -> Ad. Box size = spend on the left branch, revenue
-    on the right; color = that node's own Cut/Maintain/Scale bucket, same
-    thresholds and palette as every other chart. Click a wedge to drill in,
-    click 'Total' to zoom back out."""
-    d = tree_df.copy()
+def mind_map_level(root_label, root_metrics, children, title):
+    """A single top-down 'mind map' fan: one parent node at the top, a line
+    down to each of its direct children below, children sized by spend and
+    colored by their own Cut/Maintain/Scale bucket. `children` needs columns
+    label/spend/revenue/roas/bucket (cpa/ctr/cpc optional, shown on hover
+    when present). No numeric axes and no legend traces sharing the plot's
+    coordinate space — both caused the earlier icicle version's title/plot
+    overlap; the color key lives in the caller's caption instead."""
     bucket_colors = {**STATUS_COLORS, "root": INK["secondary"], "Insufficient data": INK["grid"]}
-    colors = [bucket_colors.get(b, INK["muted"]) for b in d["bucket"]]
+    n = len(children)
+    if n == 0:
+        return None
 
-    def fmt(v, prefix="$", suffix=""):
-        return f"{prefix}{v:,.0f}{suffix}" if pd.notna(v) else "—"
+    def fmt(v):
+        return f"${v:,.0f}" if pd.notna(v) else "—"
 
     def roas_fmt(v):
         return f"{v:.2f}x" if pd.notna(v) else "—"
 
-    hover = []
-    for _, r in d.iterrows():
-        lines = [f"<b>{r['label']}</b>", f"Spend {fmt(r['spend'])} · Revenue {fmt(r['revenue'])} · ROAS {roas_fmt(r['roas'])}"]
-        if r["bucket"] != "root":
-            lines.append(f"CPA {fmt(r['cpa'])} · CTR {r['ctr']:.2f}%" if pd.notna(r["ctr"]) else f"CPA {fmt(r['cpa'])}")
-            if pd.notna(r["cpc"]):
-                lines.append(f"CPC {fmt(r['cpc'])}")
-            lines.append(r["bucket"])
-        hover.append("<br>".join(lines))
+    xs = [i - (n - 1) / 2 for i in range(n)]
+    sizes = _sqrt_size(children["spend"], min_size=14, max_size=46)
+    colors = [bucket_colors.get(b, INK["muted"]) for b in children["bucket"]]
 
-    fig = go.Figure(go.Icicle(
-        ids=d["id"], labels=d["label"], parents=d["parent"], values=d["value"].clip(lower=0),
-        branchvalues="total", tiling=dict(orientation="v"), maxdepth=3,
-        marker=dict(colors=colors, line=dict(width=1, color=INK["surface"])),
-        customdata=hover, hovertemplate="%{customdata}<extra></extra>",
-        textfont=dict(size=12, color="#ffffff"), root_color=INK["secondary"],
+    child_hover = []
+    for _, r in children.iterrows():
+        lines = [f"<b>{r['label']}</b>", f"Spend {fmt(r['spend'])} · Revenue {fmt(r['revenue'])} · ROAS {roas_fmt(r['roas'])}"]
+        extra = [f"{lbl} {fmt(r[col])}" if col != "ctr" else f"CTR {r[col]:.2f}%"
+                 for col, lbl in [("cpa", "CPA"), ("ctr", "CTR"), ("cpc", "CPC")]
+                 if col in r.index and pd.notna(r[col])]
+        if extra:
+            lines.append(" · ".join(extra))
+        lines.append(str(r["bucket"]))
+        child_hover.append("<br>".join(lines))
+
+    root_hover = (f"<b>{root_label}</b><br>Spend {fmt(root_metrics.get('spend'))} · "
+                  f"Revenue {fmt(root_metrics.get('revenue'))} · ROAS {roas_fmt(root_metrics.get('roas'))}")
+
+    fig = go.Figure()
+    edge_x, edge_y = [], []
+    for x in xs:
+        edge_x += [0, x, None]
+        edge_y += [1, 0, None]
+    fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines", line=dict(color=INK["baseline"], width=1.5),
+                              hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(
+        x=[0], y=[1], mode="markers+text",
+        marker=dict(size=54, color=bucket_colors["root"], line=dict(width=2, color=INK["surface"])),
+        text=[str(root_label)[:26]], textposition="top center", textfont=dict(size=13, color=INK["primary"]),
+        customdata=[root_hover], hovertemplate="%{customdata}<extra></extra>", showlegend=False,
     ))
-    for label, color in [("Scale", STATUS["good"]), ("Maintain", CAT["blue"]), ("Cut", STATUS["critical"]),
-                          ("Insufficient data", INK["grid"])]:
-        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(size=10, color=color), name=label))
-    layout = {k: v for k, v in BASE_LAYOUT.items() if k not in ("xaxis", "yaxis", "margin")}
-    fig.update_layout(**layout, title=title, height=560, margin=dict(l=10, r=10, t=50, b=10))
+    fig.add_trace(go.Scatter(
+        x=xs, y=[0.0] * n, mode="markers+text",
+        marker=dict(size=sizes, color=colors, line=dict(width=1.5, color=colors)),
+        text=[str(t)[:18] for t in children["label"]], textposition="bottom center",
+        textfont=dict(size=10, color=INK["secondary"]),
+        customdata=child_hover, hovertemplate="%{customdata}<extra></extra>", showlegend=False,
+    ))
+
+    layout = {k: v for k, v in BASE_LAYOUT.items() if k not in ("xaxis", "yaxis", "margin", "legend")}
+    fig.update_layout(
+        **layout, title=title, height=380, margin=dict(l=10, r=10, t=60, b=60), showlegend=False,
+        xaxis=dict(visible=False, range=[-n / 2 - 0.8, n / 2 + 0.8]),
+        yaxis=dict(visible=False, range=[-0.45, 1.28]),
+    )
     return fig
 
 

@@ -284,13 +284,13 @@ def window_rollup(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Hierarchy tree — the whole account as one drill-down: Total splits into two
-# mirrored branches (Spend, Conversion value), each fanning out through
-# Campaign -> Ad set -> Ad. Every node's own window ROAS decides its color
-# bucket (Cut/Maintain/Scale), same thresholds as the budget tabs. Window-
-# level only (no trend) — works identically for daily or snapshot files.
+# Hierarchy drill-down — Total -> Campaign -> Ad set -> Ad, one level at a
+# time (a "mind map" star: one parent, its direct children). Every node's
+# own window ROAS decides its color bucket (Cut/Maintain/Scale), same
+# thresholds as the budget tabs. Window-level only (no trend) — works
+# identically for daily or snapshot files.
 # ---------------------------------------------------------------------------
-def _roas_bucket(roas: float, benchmark_roas: float, breakeven_roas: float) -> str:
+def roas_bucket(roas: float, benchmark_roas: float, breakeven_roas: float) -> str:
     if pd.isna(roas):
         return "Insufficient data"
     if roas < breakeven_roas:
@@ -298,59 +298,6 @@ def _roas_bucket(roas: float, benchmark_roas: float, breakeven_roas: float) -> s
     if roas >= benchmark_roas:
         return "Scale"
     return "Maintain"
-
-
-def hierarchy_tree(df: pd.DataFrame, benchmark_roas: float, breakeven_roas: float) -> pd.DataFrame:
-    """Returns one row per node (id/parent/label/value/metrics/bucket), ready
-    to hand straight to an icicle/treemap trace. `value` is spend for nodes
-    under the Spend branch and revenue for nodes under the Conversion value
-    branch, so each branch's boxes sum consistently top to bottom."""
-    camp = add_ratio_columns(df.groupby("campaign", as_index=False)[SUM_COLS].sum())
-    adset = add_ratio_columns(df.groupby(["campaign", "adset"], as_index=False)[SUM_COLS].sum())
-    ad = add_ratio_columns(df.groupby(["campaign", "adset", "ad"], as_index=False)[SUM_COLS].sum())
-
-    total_spend = df["spend"].sum()
-    total_revenue = df["revenue"].sum()
-    total_roas = total_revenue / total_spend if total_spend > 0 else np.nan
-
-    rows = [{
-        "id": "total", "parent": "", "label": "Total", "value": total_spend + total_revenue,
-        "spend": total_spend, "revenue": total_revenue, "roas": total_roas,
-        "cpa": np.nan, "ctr": np.nan, "cpc": np.nan, "bucket": "root",
-    }]
-
-    for branch, metric in [("Spend", "spend"), ("Conversion value", "revenue")]:
-        branch_id = f"branch::{branch}"
-        rows.append({
-            "id": branch_id, "parent": "total", "label": branch, "value": df[metric].sum(),
-            "spend": total_spend, "revenue": total_revenue, "roas": total_roas,
-            "cpa": np.nan, "ctr": np.nan, "cpc": np.nan, "bucket": "root",
-        })
-        for _, c in camp.iterrows():
-            cid = f"{branch}::c::{c['campaign']}"
-            rows.append({
-                "id": cid, "parent": branch_id, "label": c["campaign"], "value": c[metric],
-                "spend": c["spend"], "revenue": c["revenue"], "roas": c["roas"], "cpa": c["cpa"],
-                "ctr": c["ctr"], "cpc": c["cpc"], "bucket": _roas_bucket(c["roas"], benchmark_roas, breakeven_roas),
-            })
-        for _, a in adset.iterrows():
-            aid = f"{branch}::a::{a['campaign']}::{a['adset']}"
-            cid = f"{branch}::c::{a['campaign']}"
-            rows.append({
-                "id": aid, "parent": cid, "label": a["adset"], "value": a[metric],
-                "spend": a["spend"], "revenue": a["revenue"], "roas": a["roas"], "cpa": a["cpa"],
-                "ctr": a["ctr"], "cpc": a["cpc"], "bucket": _roas_bucket(a["roas"], benchmark_roas, breakeven_roas),
-            })
-        for _, d in ad.iterrows():
-            did = f"{branch}::d::{d['campaign']}::{d['adset']}::{d['ad']}"
-            aid = f"{branch}::a::{d['campaign']}::{d['adset']}"
-            rows.append({
-                "id": did, "parent": aid, "label": d["ad"], "value": d[metric],
-                "spend": d["spend"], "revenue": d["revenue"], "roas": d["roas"], "cpa": d["cpa"],
-                "ctr": d["ctr"], "cpc": d["cpc"], "bucket": _roas_bucket(d["roas"], benchmark_roas, breakeven_roas),
-            })
-
-    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
