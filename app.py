@@ -149,8 +149,8 @@ k5.metric("Purchases", f"{kpi['purchases']:,.0f}")
 
 st.divider()
 
-tab_campaign, tab_adset, tab_ad, tab_methodology = st.tabs(
-    ["📊 Campaign Budget", "🎯 Ad Set Budget & Anomalies", "🎨 Ad Performance", "📚 Methodology"]
+tab_hierarchy, tab_campaign, tab_adset, tab_ad, tab_methodology = st.tabs(
+    ["🏔️ Hierarchy", "📊 Campaign Budget", "🎯 Ad Set Budget & Anomalies", "🎨 Ad Performance", "📚 Methodology"]
 )
 
 
@@ -173,6 +173,27 @@ TREND_METHOD_MD = (
     "- 🟢 **Scale** — confident current level (fitted or blended) is at/above the benchmark.\n"
     "- 🔵 **Maintain** — in between.\n- ⚪ **Insufficient data** — too little history or spend to judge."
 )
+
+# ---------------------------------------------------------------------------
+# TAB 0 — Hierarchy: the whole account as one drill-down pyramid
+# ---------------------------------------------------------------------------
+with tab_hierarchy:
+    with st.expander("ℹ️ How to read this"):
+        st.markdown(
+            "**Total** splits into two mirrored branches — **Spend** (where the budget went) and "
+            "**Conversion value** (where the revenue came from) — each fanning out through the same "
+            "**Campaign → Ad set → Ad** hierarchy, so you can compare 'what did we spend on' against "
+            "'what actually paid off' side by side.\n\n"
+            "Box size = spend (left branch) or conversion value (right branch) at that level. Color = "
+            "that node's *own* window ROAS against your Cut / Maintain / Scale thresholds — same rule "
+            "as the other tabs, just window-level (no trend) since this view spans every level at once.\n\n"
+            "Only 3 levels render at first for a clean view — **click any wedge to drill into it** "
+            "(Campaign → Ad set → Ad), and click the center **Total** ring to zoom back out. Hover any "
+            "node — including individual ads — for its full metrics (spend, revenue, ROAS, CPA, CTR, CPC)."
+        )
+
+    tree_df = az.hierarchy_tree(df, benchmark_roas=benchmark_roas, breakeven_roas=breakeven_roas)
+    st.plotly_chart(ch.hierarchy_icicle(tree_df), use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # TAB 1 — Campaign budget
@@ -500,7 +521,19 @@ with tab_methodology:
         "separate creative-level dataset or model."
     )
 
-    st.subheader("7. Chart design choices")
+    st.subheader("7. Hierarchy view")
+    st.markdown(
+        "`analysis.py::hierarchy_tree` builds one node per (branch, campaign / ad set / ad) — no "
+        "model here, just a window-level rollup at every grain simultaneously. **Total** has two "
+        "children, **Spend** and **Conversion value**, each independently summing down through "
+        "Campaign → Ad set → Ad (so a campaign's box under Spend and its box under Conversion value "
+        "can be different sizes — that gap *is* the insight). Each node's color bucket "
+        "(Cut/Maintain/Scale) uses its own window ROAS against the same break-even/benchmark "
+        "thresholds as the budget tabs — window-level only, no trend, since this view spans every "
+        "level of the account at once rather than one grain at a time."
+    )
+
+    st.subheader("8. Chart design choices")
     st.markdown(
         "- **Quadrant scatter** (Campaign/Ad set/Ad tabs) — x = ROAS (performance), y = fitted trend "
         "slope in ROAS-x/day (potential/direction), bubble size = √spend, color = recommendation/"

@@ -2,6 +2,7 @@
 figure per question, status colors fixed and never re-cycled per plot."""
 
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 
 INK = {
@@ -177,6 +178,48 @@ def ad_performance_scatter(ads_df, benchmark_roas, breakeven_roas, title="Ad per
     fig.update_layout(**BASE_LAYOUT, title=title, xaxis_title="ROAS (performance)",
                        yaxis_title="Trend, ROAS x/day (potential)", height=440)
     fig.update_yaxes(range=_robust_y_range(d["trend_slope"]))
+    return fig
+
+
+def hierarchy_icicle(tree_df, title="Total → Spend / Conversion value → Campaign → Ad set → Ad"):
+    """The whole account as one drill-down pyramid: Total splits into two
+    mirrored branches (Spend, Conversion value), each fanning out through
+    Campaign -> Ad set -> Ad. Box size = spend on the left branch, revenue
+    on the right; color = that node's own Cut/Maintain/Scale bucket, same
+    thresholds and palette as every other chart. Click a wedge to drill in,
+    click 'Total' to zoom back out."""
+    d = tree_df.copy()
+    bucket_colors = {**STATUS_COLORS, "root": INK["secondary"], "Insufficient data": INK["grid"]}
+    colors = [bucket_colors.get(b, INK["muted"]) for b in d["bucket"]]
+
+    def fmt(v, prefix="$", suffix=""):
+        return f"{prefix}{v:,.0f}{suffix}" if pd.notna(v) else "—"
+
+    def roas_fmt(v):
+        return f"{v:.2f}x" if pd.notna(v) else "—"
+
+    hover = []
+    for _, r in d.iterrows():
+        lines = [f"<b>{r['label']}</b>", f"Spend {fmt(r['spend'])} · Revenue {fmt(r['revenue'])} · ROAS {roas_fmt(r['roas'])}"]
+        if r["bucket"] != "root":
+            lines.append(f"CPA {fmt(r['cpa'])} · CTR {r['ctr']:.2f}%" if pd.notna(r["ctr"]) else f"CPA {fmt(r['cpa'])}")
+            if pd.notna(r["cpc"]):
+                lines.append(f"CPC {fmt(r['cpc'])}")
+            lines.append(r["bucket"])
+        hover.append("<br>".join(lines))
+
+    fig = go.Figure(go.Icicle(
+        ids=d["id"], labels=d["label"], parents=d["parent"], values=d["value"].clip(lower=0),
+        branchvalues="total", tiling=dict(orientation="v"), maxdepth=3,
+        marker=dict(colors=colors, line=dict(width=1, color=INK["surface"])),
+        customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+        textfont=dict(size=12, color="#ffffff"), root_color=INK["secondary"],
+    ))
+    for label, color in [("Scale", STATUS["good"]), ("Maintain", CAT["blue"]), ("Cut", STATUS["critical"]),
+                          ("Insufficient data", INK["grid"])]:
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(size=10, color=color), name=label))
+    layout = {k: v for k, v in BASE_LAYOUT.items() if k not in ("xaxis", "yaxis", "margin")}
+    fig.update_layout(**layout, title=title, height=560, margin=dict(l=10, r=10, t=50, b=10))
     return fig
 
 
