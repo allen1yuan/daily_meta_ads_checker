@@ -188,7 +188,13 @@ with tab_campaign:
             "late half by day count. Late-half ROAS is compared to *the campaign's own* early-half "
             "ROAS, and to your benchmark:\n"
             "- 🔴 **Cut** — late-half ROAS is below break-even, **or** ROAS fell more than 30% from "
-            "early to late window.\n"
+            "early to late window *and the most recent single day hasn't already recovered above "
+            "benchmark*.\n"
+            "- 🔵 **Maintain (recovered)** — ROAS fell >30% early-to-late by that same test, **but** "
+            "the single most recent day is already back at/above benchmark — the late-window average "
+            "can span several days and bury a same-day turnaround, so a real rebound downgrades this "
+            "from Cut to a watch-it flag instead of an immediate cut. The 'Most recent day' column "
+            "shows the number this is based on.\n"
             "- 🟢 **Scale** — late-half ROAS is at/above the benchmark and not declining more than 5%.\n"
             "- 🔵 **Maintain** — everything else (below benchmark but above break-even, not sharply falling).\n"
             "- ⚪ **Insufficient data** — fewer than the minimum active days, or below the minimum "
@@ -256,8 +262,14 @@ with tab_campaign:
             "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
             "cpa": st.column_config.NumberColumn("CPA", format="$%.2f"),
             "early_roas": st.column_config.NumberColumn("Early-window ROAS", format="%.2fx"),
-            "late_roas": st.column_config.NumberColumn("Late-window ROAS", format="%.2fx"),
+            "late_roas": st.column_config.NumberColumn("Late-window ROAS (avg)", format="%.2fx"),
             "trend_pct": st.column_config.NumberColumn("Trend", format="%.0f%%"),
+            "latest_day_roas": st.column_config.NumberColumn(
+                "Most recent day", format="%.2fx",
+                help="ROAS on the single most recent active day — can differ from the late-window "
+                     "average above when the late window spans several days and the very latest one "
+                     "has already turned around.",
+            ),
             "recommendation": st.column_config.TextColumn("Recommendation"),
             "rationale": st.column_config.TextColumn("Why", width="large"),
         },

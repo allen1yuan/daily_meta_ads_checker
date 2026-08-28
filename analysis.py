@@ -342,7 +342,7 @@ def classify_campaigns(
             rows.append({
                 "campaign": camp, "active_days": n, "spend": total_spend, "revenue": total_revenue,
                 "roas": overall_roas, "cpa": overall_cpa, "early_roas": np.nan, "late_roas": np.nan,
-                "trend_pct": np.nan, "recommendation": "Insufficient data",
+                "trend_pct": np.nan, "latest_day_roas": np.nan, "recommendation": "Insufficient data",
                 "rationale": f"Only {n} day(s) / ${total_spend:.0f} spend in this window — not enough to judge.",
             })
             continue
@@ -358,7 +358,7 @@ def classify_campaigns(
             rows.append({
                 "campaign": camp, "active_days": n, "spend": total_spend, "revenue": total_revenue,
                 "roas": overall_roas, "cpa": overall_cpa, "early_roas": np.nan, "late_roas": np.nan,
-                "trend_pct": np.nan, "recommendation": rec, "rationale": why,
+                "trend_pct": np.nan, "latest_day_roas": np.nan, "recommendation": rec, "rationale": why,
             })
             continue
 
@@ -370,10 +370,34 @@ def classify_campaigns(
         late_roas = late["revenue"].sum() / late["spend"].sum() if late["spend"].sum() > 0 else np.nan
         trend_pct = (late_roas - early_roas) / early_roas if (pd.notna(early_roas) and early_roas > 0) else np.nan
 
-        if late_roas < breakeven_roas or (pd.notna(trend_pct) and trend_pct <= -cut_decline_pct):
+        # The "late half" can span several days (e.g. a 3-of-5 split), so its
+        # average can bury a genuine turnaround on the single most recent day —
+        # a campaign that dipped mid-window and already recovered today would
+        # otherwise read as "declining." The most recent day alone (only once
+        # it clears a minimum spend, so a few noisy dollars can't swing it) is
+        # tracked separately and can pull an otherwise trend-triggered Cut back
+        # to Maintain, without weakening the Cut rule for a campaign that's
+        # actually still below break-even in aggregate.
+        latest_day = days[-1]
+        latest = g[g["day"] == latest_day]
+        latest_spend = latest["spend"].sum()
+        latest_day_roas = (latest["revenue"].sum() / latest_spend
+                            if latest_spend >= min(5.0, min_window_spend) else np.nan)
+
+        trend_triggered_cut = late_roas >= breakeven_roas and pd.notna(trend_pct) and trend_pct <= -cut_decline_pct
+        recovered_today = pd.notna(latest_day_roas) and latest_day_roas >= benchmark_roas
+
+        if late_roas < breakeven_roas:
             rec = "Cut"
-            why = (f"Late-window ROAS {late_roas:.2f}x is below break-even." if late_roas < breakeven_roas
-                   else f"ROAS fell {abs(trend_pct):.0%} from early to late window ({early_roas:.2f}x -> {late_roas:.2f}x).")
+            why = f"Late-window ROAS {late_roas:.2f}x is below break-even."
+        elif trend_triggered_cut and recovered_today:
+            rec = "Maintain"
+            why = (f"ROAS fell {abs(trend_pct):.0%} from early to late window ({early_roas:.2f}x -> {late_roas:.2f}x) "
+                   f"averaged across the late window, but the most recent day ({latest_day.date()}) already recovered "
+                   f"to {latest_day_roas:.2f}x — worth monitoring rather than cutting immediately.")
+        elif trend_triggered_cut:
+            rec = "Cut"
+            why = f"ROAS fell {abs(trend_pct):.0%} from early to late window ({early_roas:.2f}x -> {late_roas:.2f}x)."
         elif late_roas >= benchmark_roas and (pd.isna(trend_pct) or trend_pct >= -0.05):
             rec = "Scale"
             why = f"Late-window ROAS {late_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark and holding or rising."
@@ -384,7 +408,7 @@ def classify_campaigns(
         rows.append({
             "campaign": camp, "active_days": n, "spend": total_spend, "revenue": total_revenue,
             "roas": overall_roas, "cpa": overall_cpa, "early_roas": early_roas, "late_roas": late_roas,
-            "trend_pct": trend_pct, "recommendation": rec, "rationale": why,
+            "trend_pct": trend_pct, "latest_day_roas": latest_day_roas, "recommendation": rec, "rationale": why,
         })
     return pd.DataFrame(rows).sort_values("spend", ascending=False).reset_index(drop=True)
 
