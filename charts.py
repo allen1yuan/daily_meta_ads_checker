@@ -154,14 +154,29 @@ def ad_funnel(impressions, link_clicks, purchases, title):
 
 
 
-def mind_map_level(root_label, root_metrics, children, title):
+def mind_map_level(root_label, root_metrics, children, title, label_top_n=14):
     """A single top-down 'mind map' fan: one parent node at the top, a line
     down to each of its direct children below, children sized by spend and
     colored by their own Cut/Maintain/Scale bucket. `children` needs columns
     label/spend/revenue/roas/bucket (cpa/ctr/cpc optional, shown on hover
-    when present). No numeric axes and no legend traces sharing the plot's
-    coordinate space — both caused the earlier icicle version's title/plot
-    overlap; the color key lives in the caller's caption instead."""
+    when present), and should already be sorted by spend descending.
+
+    Labels are staggered two rows deep, alternating near/far below each
+    node, rather than all sitting at one fixed offset — sorted-by-spend
+    means the labeled nodes are contiguous on the left, so at real account
+    scale (16+ campaigns) same-height neighbors collide into an unreadable
+    smear regardless of how many are labeled; staggering roughly doubles
+    the horizontal gap between same-height labels before that happens.
+    Only the first `label_top_n` get a label at all past that (same
+    declutter pattern as the quadrant charts); the rest are still plotted
+    and hoverable, just unlabeled.
+
+    No numeric axes and no legend traces sharing the plot's coordinate
+    space — both caused the earlier icicle version's title/plot overlap;
+    the color key lives in the caller's caption instead. The root node
+    itself carries no text label — the title already names it, and
+    repeating it directly above the node is what collided with the title
+    in an earlier version."""
     bucket_colors = {**STATUS_COLORS, "root": INK["secondary"]}
     n = len(children)
     if n == 0:
@@ -199,25 +214,35 @@ def mind_map_level(root_label, root_metrics, children, title):
     fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines", line=dict(color=INK["baseline"], width=1.5),
                               hoverinfo="skip", showlegend=False))
     fig.add_trace(go.Scatter(
-        x=[0], y=[1], mode="markers+text",
+        x=[0], y=[1], mode="markers",
         marker=dict(size=54, color=bucket_colors["root"], line=dict(width=2, color=INK["surface"])),
-        text=[str(root_label)[:26]], textposition="top center", textfont=dict(size=13, color=INK["primary"]),
         customdata=[root_hover], hovertemplate="%{customdata}<extra></extra>", showlegend=False,
     ))
     fig.add_trace(go.Scatter(
-        x=xs, y=[0.0] * n, mode="markers+text",
+        x=xs, y=[0.0] * n, mode="markers",
         marker=dict(size=sizes, color=colors, line=dict(width=1.5, color=colors)),
-        text=[str(t)[:18] for t in children["label"]], textposition="bottom center",
-        textfont=dict(size=10, color=INK["secondary"]),
         customdata=child_hover, hovertemplate="%{customdata}<extra></extra>", showlegend=False,
+    ))
+
+    label_idx = list(range(min(n, label_top_n)))
+    fig.add_trace(go.Scatter(
+        x=[xs[i] for i in label_idx],
+        y=[-0.09 if i % 2 == 0 else -0.24 for i in label_idx],
+        mode="text", text=[str(children["label"].iloc[i])[:14] for i in label_idx],
+        textfont=dict(size=10, color=INK["secondary"]), hoverinfo="skip", showlegend=False,
     ))
 
     layout = {k: v for k, v in BASE_LAYOUT.items() if k not in ("xaxis", "yaxis", "margin", "legend")}
     fig.update_layout(
-        **layout, title=title, height=380, margin=dict(l=10, r=10, t=60, b=60), showlegend=False,
+        **layout, title=title, height=420, margin=dict(l=10, r=10, t=50, b=20), showlegend=False,
         xaxis=dict(visible=False, range=[-n / 2 - 0.8, n / 2 + 0.8]),
-        yaxis=dict(visible=False, range=[-0.45, 1.28]),
+        yaxis=dict(visible=False, range=[-0.42, 1.2]),
     )
+    if n > label_top_n:
+        fig.add_annotation(
+            text=f"+{n - label_top_n} more (hover to see)", x=1, y=0, xref="paper", yref="paper",
+            xanchor="right", yanchor="bottom", showarrow=False, font=dict(size=10, color=INK["muted"]),
+        )
     return fig
 
 
