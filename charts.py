@@ -12,12 +12,7 @@ INK = {
 CAT = {"blue": "#2a78d6", "orange": "#eb6834", "aqua": "#1baf7a", "violet": "#4a3aa7", "yellow": "#eda100"}
 STATUS = {"good": "#0ca30c", "warning": "#fab219", "critical": "#d03b3b", "muted": "#898781"}
 
-STATUS_COLORS = {
-    "Scale": STATUS["good"], "Maintain": CAT["blue"], "Cut": STATUS["critical"],
-    "Insufficient data": STATUS["muted"],
-    "critical": STATUS["critical"], "warning": STATUS["warning"],
-    "low_delivery": STATUS["muted"], "insufficient_history": INK["grid"], "healthy": STATUS["good"],
-}
+STATUS_COLORS = {"Scale": STATUS["good"], "Maintain": CAT["blue"], "Cut": STATUS["critical"]}
 
 BASE_LAYOUT = dict(
     plot_bgcolor=INK["surface"], paper_bgcolor=INK["surface"],
@@ -80,9 +75,8 @@ def budget_quadrant(df, entity_col, benchmark_roas, breakeven_roas, title, label
     spend, color = recommendation. A filled marker means the trend was
     confident enough to use; a hollow marker means the day-to-day pattern
     was too noisy to fit a direction, so the recommendation rests on the
-    ROAS level alone. 'Insufficient data' rows are excluded (nothing
-    reliable to plot) — their count is reported by the caller separately."""
-    d = df[df["recommendation"] != "Insufficient data"].copy()
+    ROAS level alone."""
+    d = df.copy()
     if d.empty:
         return None
     sizes = _sqrt_size(d["spend"])
@@ -119,8 +113,8 @@ def budget_quadrant(df, entity_col, benchmark_roas, breakeven_roas, title, label
     return fig
 
 
-def anomaly_scatter(pool_df, title="Ad set anomaly detection (CTR vs. CPC)"):
-    """Multivariate view of every pooled ad-set-day: x = CPC, y = CTR, sized
+def anomaly_scatter(pool_df, group_col="adset", title="Anomaly detection (CTR vs. CPC)"):
+    """Multivariate view of every pooled (group, day): x = CPC, y = CTR, sized
     by spend, flagged points (from the Isolation Forest) in red."""
     d = pool_df.copy()
     sizes = _sqrt_size(d["spend"], min_size=6, max_size=30)
@@ -131,7 +125,7 @@ def anomaly_scatter(pool_df, title="Ad set anomaly detection (CTR vs. CPC)"):
     fig.add_trace(go.Scatter(
         x=d["cpc"], y=d["ctr"], mode="markers",
         marker=dict(size=sizes, color=colors, opacity=opacities, line=dict(width=0)),
-        customdata=np.stack([d["adset"], d["day"].dt.strftime("%Y-%m-%d"), d["spend"]], axis=-1),
+        customdata=np.stack([d[group_col], d["day"].dt.strftime("%Y-%m-%d"), d["spend"]], axis=-1),
         hovertemplate="<b>%{customdata[0]}</b> (%{customdata[1]})<br>CPC $%{x:.2f}<br>CTR %{y:.2f}%"
                       "<br>Spend $%{customdata[2]:,.0f}<extra></extra>",
         showlegend=False,
@@ -142,43 +136,22 @@ def anomaly_scatter(pool_df, title="Ad set anomaly detection (CTR vs. CPC)"):
     return fig
 
 
-def ad_performance_scatter(ads_df, benchmark_roas, breakeven_roas, title="Ad performance", label_top_n=6):
-    """Same quadrant language as the budget charts, at the ad grain: x =
-    ROAS, y = fitted trend slope, size = spend, color = status."""
-    d = ads_df[~ads_df["status"].isin(["insufficient_history", "low_delivery"])].copy()
-    if d.empty:
-        return None
-    sizes = _sqrt_size(d["spend"])
-    colors = [STATUS_COLORS.get(s, INK["muted"]) for s in d["status"]]
-    symbols = ["circle" if c else "circle-open" for c in d["trend_confident"]]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=d["roas"], y=d["trend_slope"].fillna(0.0), mode="markers",
-        marker=dict(size=sizes, color=colors, symbol=symbols, line=dict(width=1.5, color=colors)),
-        customdata=np.stack([d["ad"], d["spend"], d["roas"], d["trend_slope"].fillna(0.0)], axis=-1),
-        hovertemplate="<b>%{customdata[0]}</b><br>Spend $%{customdata[1]:,.0f}<br>ROAS %{customdata[2]:.2f}x"
-                      "<br>Trend %{customdata[3]:+.3f}x/day<extra></extra>",
-        showlegend=False,
+def ad_funnel(impressions, link_clicks, purchases, title):
+    """A single ad's latest-day funnel: Impressions -> Link clicks ->
+    Purchases. No cartesian axes needed for a funnel trace, so — same lesson
+    as the mind map — they're excluded from the layout rather than risking
+    a stray axis bleeding into the chart."""
+    fig = go.Figure(go.Funnel(
+        y=["Impressions", "Link clicks", "Purchases"],
+        x=[impressions, link_clicks, purchases],
+        textinfo="value+percent initial",
+        marker=dict(color=[CAT["blue"], CAT["aqua"], STATUS["good"]]),
+        connector=dict(line=dict(color=INK["baseline"], width=1)),
     ))
-    top = d.nlargest(label_top_n, "spend")
-    fig.add_trace(go.Scatter(
-        x=top["roas"], y=top["trend_slope"].fillna(0.0), mode="text",
-        text=[str(t)[:20] for t in top["ad"]], textposition="top center",
-        textfont=dict(size=9, color=INK["secondary"]), showlegend=False,
-    ))
-    fig.add_vline(x=breakeven_roas, line_color=INK["baseline"], line_width=1, annotation_text="break-even")
-    fig.add_vline(x=benchmark_roas, line_color=STATUS["good"], line_width=1, line_dash="dot",
-                  annotation_text=f"{benchmark_roas:.1f}x benchmark")
-    fig.add_hline(y=0, line_color=INK["baseline"], line_width=1)
-
-    for label, color in [("Critical", STATUS["critical"]), ("Warning", STATUS["warning"]), ("Healthy", STATUS["good"])]:
-        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(size=10, color=color), name=label))
-
-    fig.update_layout(**BASE_LAYOUT, title=title, xaxis_title="ROAS (performance)",
-                       yaxis_title="Trend, ROAS x/day (potential)", height=440)
-    fig.update_yaxes(range=_robust_y_range(d["trend_slope"]))
+    layout = {k: v for k, v in BASE_LAYOUT.items() if k not in ("xaxis", "yaxis", "legend")}
+    fig.update_layout(**layout, title=title, height=300, showlegend=False)
     return fig
+
 
 
 def mind_map_level(root_label, root_metrics, children, title):
@@ -189,7 +162,7 @@ def mind_map_level(root_label, root_metrics, children, title):
     when present). No numeric axes and no legend traces sharing the plot's
     coordinate space — both caused the earlier icicle version's title/plot
     overlap; the color key lives in the caller's caption instead."""
-    bucket_colors = {**STATUS_COLORS, "root": INK["secondary"], "Insufficient data": INK["grid"]}
+    bucket_colors = {**STATUS_COLORS, "root": INK["secondary"]}
     n = len(children)
     if n == 0:
         return None
@@ -251,7 +224,7 @@ def mind_map_level(root_label, root_metrics, children, title):
 def budget_bar_snapshot(df, entity_col, title):
     """Snapshot-mode fallback (no trend axis available): spend by entity,
     colored by recommendation — still a plot, not a table."""
-    d = df[df["recommendation"] != "Insufficient data"].sort_values("spend").tail(20)
+    d = df.sort_values("spend").tail(20)
     if d.empty:
         return None
     colors = [STATUS_COLORS.get(r, INK["muted"]) for r in d["recommendation"]]

@@ -29,6 +29,7 @@ STATUS_LABELS = {
 }
 STATUS_ORDER = ["critical", "warning", "low_delivery", "insufficient_history", "healthy"]
 R2_THRESHOLD = 0.35  # weighted-regression trend must clear this fit quality to be trusted
+CUT_NO_SALES_DAYS = 3  # Campaign/Ad set cut rule: zero sales on each of the last N days
 
 
 # ---------------------------------------------------------------------------
@@ -50,23 +51,36 @@ benchmark_roas = st.sidebar.number_input(
     help="The ROAS level a healthy campaign/ad set/ad should hold. Set this from your own "
          "longer-run history — it isn't derived from this file.",
 )
-breakeven_roas = st.sidebar.number_input("Break-even ROAS", min_value=0.0, value=1.0, step=0.1)
+breakeven_roas = st.sidebar.number_input(
+    "Break-even ROAS", min_value=0.0, value=1.0, step=0.1,
+    help="Used for the Ad tab's Critical/Warning/Healthy status, not the Campaign/Ad set Cut rule "
+         "below (that one is spend + no-sales driven).",
+)
 refresh_ratio = st.sidebar.slider(
     "Ad refresh trigger (% of benchmark)", 0.3, 0.95, 0.7, 0.05,
     help="An ad below this fraction of the benchmark ROAS is flagged for review.",
 )
 min_window_spend = st.sidebar.number_input(
     "Minimum window spend to judge ($)", min_value=0.0, value=15.0, step=5.0,
-    help="Below this total spend, ROAS is treated as noise, not a verdict.",
+    help="Ad tab only. Below this total spend, ROAS is treated as noise, not a verdict.",
 )
 min_active_days = st.sidebar.slider(
     "Minimum active days to judge", 1, 7, 3,
-    help="Daily files only — ignored for single-window snapshots.",
+    help="Ad tab only, daily files. Ignored for single-window snapshots.",
 )
 anomaly_sensitivity = st.sidebar.slider(
-    "Ad set anomaly sensitivity", 0.02, 0.20, 0.08, 0.01,
-    help="Expected share of ad-set-days flagged as anomalous by the model (daily files with "
-         "enough pooled history only). Higher = more flags.",
+    "Anomaly sensitivity", 0.02, 0.20, 0.08, 0.01,
+    help="Expected share of ad-set-days / ad-days flagged as anomalous by the model (daily files "
+         "with enough pooled history only). Higher = more flags.",
+)
+st.sidebar.caption("Campaign / Ad set Cut rule")
+cut_today_spend = st.sidebar.number_input(
+    "Cut if today's spend over ($)", min_value=0.0, value=50.0, step=5.0,
+    help="Combined with cumulative spend below (either can trigger) and zero sales on each of the "
+         "last 3 days — spend with no recent payoff.",
+)
+cut_cumulative_spend = st.sidebar.number_input(
+    "...or cumulative window spend over ($)", min_value=0.0, value=100.0, step=5.0,
 )
 
 
@@ -126,6 +140,8 @@ if len(accounts) > 1:
 else:
     df = df_all
 
+all_window_days = sorted(df["day"].unique())  # fixed reference for "today" / "last N days" everywhere
+
 date_min, date_max = result.window_start.date(), result.window_end.date()
 span_days = (date_max - date_min).days + 1
 mode_label = "daily breakdown" if hdg else "single-window snapshot"
@@ -156,22 +172,24 @@ tab_hierarchy, tab_campaign, tab_adset, tab_ad, tab_methodology = st.tabs(
 
 def _rec_counts_row(rec_df):
     counts = rec_df["recommendation"].value_counts()
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("🟢 Scale", int(counts.get("Scale", 0)))
     c2.metric("🔵 Maintain", int(counts.get("Maintain", 0)))
     c3.metric("🔴 Cut", int(counts.get("Cut", 0)))
-    c4.metric("⚪ Insufficient", int(counts.get("Insufficient data", 0)))
 
 
-TREND_METHOD_MD = (
-    "A **spend-weighted linear regression** is fit through every available day's ROAS (not just "
-    "two arbitrary buckets), and only trusted (filled marker) when it clears a minimum fit quality "
-    "(R² ≥ 0.35) and has at least 4 days — a noisy or non-monotonic run of days (e.g. a dip that "
-    "already recovered) fails that bar on its own, and the recommendation falls back to the plain "
-    "window-average ROAS (hollow marker) instead of an unreliable direction.\n"
-    "- 🔴 **Cut** — blended ROAS is below break-even, or a confident trend projects below it.\n"
-    "- 🟢 **Scale** — confident current level (fitted or blended) is at/above the benchmark.\n"
-    "- 🔵 **Maintain** — in between.\n- ⚪ **Insufficient data** — too little history or spend to judge."
+BUDGET_RULE_MD = (
+    f"Checked in order, same rule for Campaigns and Ad sets:\n\n"
+    f"1. 🔴 **Cut** — today's spend is over **\\${cut_today_spend:.0f}**, or cumulative window spend "
+    f"is over **\\${cut_cumulative_spend:.0f}**, *and* there have been zero sales on **each of the "
+    f"last {CUT_NO_SALES_DAYS} days** in the file. Spend without recent payoff.\n"
+    f"2. 🟢 **Scale** — otherwise, if today's ROAS is at/above the **{benchmark_roas:.2f}x** "
+    "benchmark, or the same spend-weighted trend used elsewhere (R² ≥ 0.35, 4+ days) is confidently "
+    "improving. Either signal is a reason to push more budget in.\n"
+    "3. 🔵 **Maintain** — otherwise: no cut signal, no scale signal.\n\n"
+    "Needs daily data for \"today\" and the no-sales streak; single-window snapshots treat the whole "
+    "window as today and skip the streak check (undefined for one data point) — Cut can't trigger "
+    "there."
 )
 
 # ---------------------------------------------------------------------------
@@ -180,21 +198,26 @@ TREND_METHOD_MD = (
 with tab_hierarchy:
     with st.expander("ℹ️ How to read this"):
         st.markdown(
-            "A top-down mind map, one level at a time: the top node is the parent, each node below it "
-            "is a direct child, sized by spend. Color = that node's *own* window ROAS against your "
-            "Cut / Maintain / Scale thresholds (🟢 Scale · 🔵 Maintain · 🔴 Cut · ⚪ Insufficient data) — "
-            "window-level, not a trend, since this spans every level of the account. Hover any node "
-            "for its full metrics.\n\n"
-            "**Pick a campaign** below to fan out its ad sets, then **pick an ad set** to fan out its "
-            "individual ads — CPA/CTR/CPC show on hover at that level."
+            "A top-down mind map: the top node is the parent, each node below it is a direct child, "
+            "sized by spend. Color is that node's own **Cut / Maintain / Scale** call — the same rule "
+            "as the Campaign Budget and Ad Set Budget tabs (see their methodology expanders), so a "
+            "campaign or ad set is colored identically everywhere in the app. Hover any node for its "
+            "full metrics.\n\n"
+            "**Pick a campaign** below to fan out its ad sets. Individual ads have their own tab — "
+            "🎨 Ad Performance."
         )
 
-    def _bucketed(roll):
-        roll = roll.copy()
-        roll["bucket"] = roll["roas"].apply(lambda r: az.roas_bucket(r, benchmark_roas, breakeven_roas))
+    def _mind_map_roll(sub_df, level_col):
+        roll = az.classify_budget_level(
+            sub_df, level_col, benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
+            cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
+            cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
+        )
+        roll = roll.rename(columns={level_col: "label"})
+        roll["bucket"] = roll["recommendation"]
         return roll.sort_values("spend", ascending=False)
 
-    hier_camp_roll = _bucketed(az.window_rollup(df, ["campaign"]).rename(columns={"campaign": "label"}))
+    hier_camp_roll = _mind_map_roll(df, "campaign")
     fig = ch.mind_map_level("Total", kpi, hier_camp_roll, "Total → Campaigns")
     if fig is not None:
         st.plotly_chart(fig, use_container_width=True)
@@ -205,40 +228,24 @@ with tab_hierarchy:
 
     hier_camp_df = df[df["campaign"] == hier_pick_campaign]
     hier_camp_row = hier_camp_roll.loc[hier_camp_roll["label"] == hier_pick_campaign].iloc[0]
-    hier_adset_roll = _bucketed(az.window_rollup(hier_camp_df, ["adset"]).rename(columns={"adset": "label"}))
+    hier_adset_roll = _mind_map_roll(hier_camp_df, "adset")
     fig2 = ch.mind_map_level(hier_pick_campaign, hier_camp_row, hier_adset_roll, f"{hier_pick_campaign} → Ad sets")
     if fig2 is not None:
         st.plotly_chart(fig2, use_container_width=True)
     else:
         st.info("No ad sets under this campaign with data to plot.")
-        hier_adset_roll = None
-
-    if hier_adset_roll is not None:
-        hier_pick_adset = st.selectbox(
-            f"Drill into an ad set (within '{hier_pick_campaign}')", hier_adset_roll["label"].tolist()
-        )
-        hier_adset_df = hier_camp_df[hier_camp_df["adset"] == hier_pick_adset]
-        hier_adset_row = hier_adset_roll.loc[hier_adset_roll["label"] == hier_pick_adset].iloc[0]
-        hier_ad_roll = _bucketed(az.window_rollup(hier_adset_df, ["ad"]).rename(columns={"ad": "label"}))
-        fig3 = ch.mind_map_level(hier_pick_adset, hier_adset_row, hier_ad_roll, f"{hier_pick_adset} → Ads")
-        if fig3 is not None:
-            st.plotly_chart(fig3, use_container_width=True)
-        else:
-            st.info("No ads under this ad set with data to plot.")
 
 # ---------------------------------------------------------------------------
 # TAB 1 — Campaign budget
 # ---------------------------------------------------------------------------
 with tab_campaign:
     with st.expander("ℹ️ How Scale / Maintain / Cut is decided"):
-        st.markdown(TREND_METHOD_MD if hdg else
-                     "No Day column in this file, so no trend can be fit — each campaign is classified "
-                     "on its window ROAS alone versus break-even and the benchmark.")
+        st.markdown(BUDGET_RULE_MD)
 
     camp_df = az.classify_budget_level(
         df, "campaign", benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
-        breakeven_roas=breakeven_roas, min_window_spend=min_window_spend,
-        min_active_days=min_active_days, r2_threshold=R2_THRESHOLD,
+        cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
+        cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
     )
     _rec_counts_row(camp_df)
 
@@ -271,10 +278,12 @@ with tab_campaign:
                 "revenue": st.column_config.NumberColumn("Revenue", format="$%.0f"),
                 "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
                 "cpa": st.column_config.NumberColumn("CPA", format="$%.2f"),
+                "today_spend": st.column_config.NumberColumn("Today spend", format="$%.0f"),
+                "today_roas": st.column_config.NumberColumn("Today ROAS", format="%.2fx"),
+                "no_sales_recent": st.column_config.CheckboxColumn(f"No sales, {CUT_NO_SALES_DAYS}d"),
                 "trend_slope": st.column_config.NumberColumn("Trend (x/day)", format="%.3f"),
                 "trend_r2": st.column_config.NumberColumn("Trend fit (R²)", format="%.2f"),
                 "trend_confident": st.column_config.CheckboxColumn("Trend trusted?"),
-                "decision_level": st.column_config.NumberColumn("Decision level", format="%.2fx"),
                 "recommendation": st.column_config.TextColumn("Recommendation"),
                 "rationale": st.column_config.TextColumn("Why", width="large"),
             },
@@ -286,20 +295,19 @@ with tab_campaign:
 with tab_adset:
     with st.expander("ℹ️ How this is decided"):
         st.markdown(
-            "**Budget** — the same weighted-regression trend as campaigns, applied at the ad set grain.\n\n"
-            "**Anomalies** — every pooled ad-set-day's CTR and CPC are z-scored *within that ad set* "
-            "(so 'unusual' means unusual for it, not just bigger), then a multivariate outlier model "
-            "(Isolation Forest) flags days that are jointly unusual — catching e.g. 'CPC drifted up "
-            "*and* CTR drifted down together' even if neither alone crosses a hard threshold. This "
-            "needs a reasonable pool of ad-set-days (30+) to be meaningful; with less, it falls back "
-            "to a simple day-over-day percent-change rule, and with a single-window snapshot it's "
-            "unavailable entirely (nothing to compare)."
+            "**Budget**\n\n" + BUDGET_RULE_MD + "\n\n**Anomalies** — every pooled ad-set-day's CTR "
+            "and CPC are z-scored *within that ad set* (so 'unusual' means unusual for it, not just "
+            "bigger), then a multivariate outlier model (Isolation Forest) flags days that are "
+            "jointly unusual — catching e.g. 'CPC drifted up *and* CTR drifted down together' even "
+            "if neither alone crosses a hard threshold. This needs a reasonable pool of ad-set-days "
+            "(30+) to be meaningful; with less, it falls back to a simple day-over-day percent-change "
+            "rule, and with a single-window snapshot it's unavailable entirely (nothing to compare)."
         )
 
     adset_budget = az.classify_budget_level(
         df, "adset", benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
-        breakeven_roas=breakeven_roas, min_window_spend=min_window_spend,
-        min_active_days=min_active_days, r2_threshold=R2_THRESHOLD,
+        cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
+        cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
     )
     _rec_counts_row(adset_budget)
 
@@ -317,14 +325,15 @@ with tab_adset:
         st.info("No ad sets with enough data to plot yet.")
 
     st.subheader("Anomaly detection")
-    anomalies, method, pool = az.detect_adset_anomalies(df, has_daily_granularity=hdg, contamination=anomaly_sensitivity)
+    anomalies, method, pool = az.detect_anomalies(df, "adset", has_daily_granularity=hdg, contamination=anomaly_sensitivity)
     if method == "unavailable":
         st.info("No day-over-day data in this file (single-window snapshot) — nothing to compare.")
     elif method == "ml":
         latest_day = pool["day"].max()
         pool_latest = pool[pool["day"] == latest_day]
         st.plotly_chart(
-            ch.anomaly_scatter(pool_latest, title=f"Ad set anomaly detection — {latest_day.date()} (CTR vs. CPC)"),
+            ch.anomaly_scatter(pool_latest, group_col="adset",
+                                title=f"Ad set anomaly detection — {latest_day.date()} (CTR vs. CPC)"),
             use_container_width=True,
         )
         st.caption(
@@ -353,10 +362,12 @@ with tab_adset:
                 "revenue": st.column_config.NumberColumn("Revenue", format="$%.0f"),
                 "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
                 "cpa": st.column_config.NumberColumn("CPA", format="$%.2f"),
+                "today_spend": st.column_config.NumberColumn("Today spend", format="$%.0f"),
+                "today_roas": st.column_config.NumberColumn("Today ROAS", format="%.2fx"),
+                "no_sales_recent": st.column_config.CheckboxColumn(f"No sales, {CUT_NO_SALES_DAYS}d"),
                 "trend_slope": st.column_config.NumberColumn("Trend (x/day)", format="%.3f"),
                 "trend_r2": st.column_config.NumberColumn("Trend fit (R²)", format="%.2f"),
                 "trend_confident": st.column_config.CheckboxColumn("Trend trusted?"),
-                "decision_level": st.column_config.NumberColumn("Decision level", format="%.2fx"),
                 "recommendation": st.column_config.TextColumn("Recommendation"),
                 "rationale": st.column_config.TextColumn("Why", width="large"),
             },
@@ -366,16 +377,16 @@ with tab_adset:
 # TAB 3 — Ad performance
 # ---------------------------------------------------------------------------
 with tab_ad:
-    with st.expander("ℹ️ How ad status is decided"):
+    with st.expander("ℹ️ How this is decided"):
         st.markdown(
-            "Checked in order — **data sufficiency before performance**:\n"
-            "1. ⬜ **Insufficient history** — fewer than the minimum active days (daily files only).\n"
-            "2. ⚪ **Low delivery** — total window spend below the floor; the ROAS number is sampling "
-            "noise, not a verdict.\n"
-            "3. 🔴 **Critical** — ROAS below break-even, or a confident trend projects below it.\n"
-            "4. 🟠 **Warning** — confident current level below the refresh-trigger fraction of benchmark.\n"
-            "5. 🟢 **Healthy** — everything else.\n\n"
-            + (TREND_METHOD_MD.split("\n", 1)[0] if hdg else "")
+            "**Status** (Critical/Warning/Healthy, shown below and available in the ranking table) "
+            "checks data sufficiency before performance, same as before — see `classify_ads` in the "
+            "Methodology tab.\n\n"
+            "**Anomalies** — every pooled ad-day's CTR and CPC are z-scored *within that ad's own "
+            "history*, then a multivariate outlier model (Isolation Forest) flags days that are "
+            "jointly unusual — same approach as the Ad Set tab, applied one grain finer. Needs 30+ "
+            "pooled ad-days to be meaningful; falls back to a day-over-day percent-change rule below "
+            "that, and is unavailable for single-window snapshots."
         )
 
     ads_df = az.classify_ads(
@@ -391,62 +402,131 @@ with tab_ad:
     s4.metric("⚪ Low delivery", int(status_counts.get("low_delivery", 0)))
     s5.metric("⬜ Insufficient", int(status_counts.get("insufficient_history", 0)))
 
-    if hdg:
-        fig = ch.ad_performance_scatter(ads_df, benchmark_roas, breakeven_roas)
-        if fig is not None:
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("Filled marker = trend trusted (R² ≥ 0.35); hollow = too noisy, status rests on the ROAS level. "
-                       "Y-axis is scaled to the 2nd–98th percentile of trend values so one volatile low-day-count ad "
-                       "can't flatten the rest — hover any point for its exact trend.")
-        else:
-            st.info("No ads with enough data to plot yet.")
+    # -------------------------------------------------------------------
+    # Anomalies — list only the flagged ads, not all of them
+    # -------------------------------------------------------------------
+    st.subheader("Anomalies")
+    ad_anomalies, ad_method, ad_pool = az.detect_anomalies(
+        df, "ad", has_daily_granularity=hdg, contamination=anomaly_sensitivity
+    )
+    latest_day = all_window_days[-1] if all_window_days else None
+    flagged_today = pd.DataFrame()
+
+    if ad_method == "unavailable":
+        st.info("No day-over-day data in this file (single-window snapshot) — nothing to compare.")
+    elif ad_method == "ml":
+        pool_latest = ad_pool[ad_pool["day"] == latest_day]
+        st.plotly_chart(
+            ch.anomaly_scatter(pool_latest, group_col="ad",
+                                title=f"Ad anomaly detection — {latest_day.date()} (CTR vs. CPC)"),
+            use_container_width=True,
+        )
+        flagged_today = ad_anomalies[ad_anomalies["day"] == latest_day].sort_values("score", ascending=False)
+        st.caption(
+            f"{int(pool_latest['is_anomaly'].sum())} of {len(pool_latest)} ads flagged for "
+            f"**{latest_day.date()}**. Model is fit on all {len(ad_pool)} pooled ad-days in the window; "
+            "only the latest day is plotted."
+        )
+    elif len(ad_anomalies):
+        st.caption("Not enough pooled history yet for the anomaly model — showing each flagged ad's "
+                    "most recent day-over-day flag instead.")
+        flagged_today = ad_anomalies.sort_values("day").groupby("ad", as_index=False).tail(1)
     else:
-        judged = ads_df[~ads_df["status"].isin(["insufficient_history", "low_delivery"])]
-        status_to_rec = {"critical": "Cut", "warning": "Maintain", "healthy": "Scale"}
-        plot_df = pd.DataFrame({
-            "ad": judged["ad"], "spend": judged["spend"],
-            "recommendation": judged["status"].map(status_to_rec),
+        st.success("No anomalies detected at the current thresholds.")
+
+    if len(flagged_today):
+        view_options = ["Latest day (funnel)", "Across days (trend)"] if hdg else ["Latest day (funnel)"]
+        view_mode = st.radio("View", view_options, horizontal=True, key="ad_anomaly_view")
+        for _, flag_row in flagged_today.head(8).iterrows():
+            ad_name = flag_row["ad"]
+            with st.expander(f"{ad_name}  —  {flag_row['detail']}"):
+                ad_daily = az.daily_rollup(df[df["ad"] == ad_name], []).sort_values("day")
+                if view_mode.startswith("Latest"):
+                    latest_row = ad_daily[ad_daily["day"] == flag_row["day"]]
+                    if len(latest_row):
+                        r = latest_row.iloc[0]
+                        st.plotly_chart(
+                            ch.ad_funnel(r["impressions"], r["link_clicks"], r["purchases"],
+                                         f"{ad_name} — {flag_row['day'].date()}"),
+                            use_container_width=True,
+                        )
+                else:
+                    fig_roas, fig_ctr = ch.ad_roas_ctr_chart(
+                        ad_daily["day"], ad_daily["roas"], ad_daily["ctr"], breakeven_roas, benchmark_roas
+                    )
+                    tc1, tc2 = st.columns(2)
+                    tc1.plotly_chart(fig_roas, use_container_width=True)
+                    tc2.plotly_chart(fig_ctr, use_container_width=True)
+        if len(flagged_today) > 8:
+            st.caption(f"Showing the top 8 of {len(flagged_today)} flagged ads.")
+
+    # -------------------------------------------------------------------
+    # Ranking — every ad, sortable on multiple columns in priority order
+    # -------------------------------------------------------------------
+    st.subheader("Ranking")
+    rank_mode = st.radio("Metrics from", ["All days (window)", "Single day"], horizontal=True, key="ad_rank_mode")
+
+    creative_lookup = df[["ad", "creative_type"]].drop_duplicates()
+
+    if rank_mode == "Single day" and hdg:
+        rank_day = st.selectbox("Day", all_window_days, index=len(all_window_days) - 1,
+                                 format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d"))
+        rank_df = az.window_rollup(df[df["day"] == rank_day], ["ad"]).merge(creative_lookup, on="ad", how="left")
+        is_all_days = False
+    else:
+        rank_df = az.window_rollup(df, ["ad"]).merge(creative_lookup, on="ad", how="left")
+        rank_df = rank_df.merge(
+            ads_df[["ad", "status", "trend_slope", "trend_confident", "delivery_declining"]], on="ad", how="left"
+        )
+        is_all_days = True
+
+    sort_cols = [("spend", "Spend"), ("revenue", "Revenue"), ("roas", "ROAS"), ("cpa", "CPA"),
+                 ("ctr", "CTR"), ("cpc", "CPC"), ("cpm", "CPM")]
+    if is_all_days:
+        sort_cols += [("active_days", "Active days"), ("trend_slope", "Trend (x/day)")]
+    sort_options = {}
+    for col, label in sort_cols:
+        sort_options[f"{label} (high → low)"] = (col, False)
+        sort_options[f"{label} (low → high)"] = (col, True)
+
+    picked_sorts = st.multiselect(
+        "Sort by (priority order — first pick is primary)", list(sort_options.keys()),
+        default=["Spend (high → low)"],
+    )
+    if picked_sorts:
+        rank_df = rank_df.sort_values(
+            by=[sort_options[p][0] for p in picked_sorts],
+            ascending=[sort_options[p][1] for p in picked_sorts],
+            na_position="last",
+        )
+    else:
+        rank_df = rank_df.sort_values("spend", ascending=False)
+
+    display_cols = ["ad", "creative_type", "spend", "revenue", "roas", "cpa", "ctr", "cpc"]
+    col_config = {
+        "ad": st.column_config.TextColumn("Ad", width="medium"), "creative_type": "Type",
+        "spend": st.column_config.NumberColumn("Spend", format="$%.0f"),
+        "revenue": st.column_config.NumberColumn("Revenue", format="$%.0f"),
+        "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
+        "cpa": st.column_config.NumberColumn("CPA", format="$%.2f"),
+        "ctr": st.column_config.NumberColumn("CTR", format="%.2f%%"),
+        "cpc": st.column_config.NumberColumn("CPC", format="$%.2f"),
+    }
+    if is_all_days:
+        rank_df = rank_df.copy()
+        rank_df["status_label"] = rank_df["status"].map(STATUS_LABELS).fillna(rank_df["status"])
+        display_cols += ["active_days", "status_label", "trend_slope", "delivery_declining"]
+        col_config.update({
+            "active_days": st.column_config.NumberColumn("Days"),
+            "status_label": "Status",
+            "trend_slope": st.column_config.NumberColumn("Trend (x/day)", format="%.3f"),
+            "delivery_declining": st.column_config.CheckboxColumn("Delivery declining?"),
         })
-        fig = ch.budget_bar_snapshot(plot_df, "ad", "Ads by spend, colored by status")
-        if fig is not None:
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No ads with enough data to plot yet.")
 
-    with st.expander("📋 Full ad table"):
-        display_df = ads_df.copy()
-        display_df["status_label"] = display_df["status"].map(STATUS_LABELS)
-        st.dataframe(
-            display_df[["ad", "creative_type", "status_label", "spend", "revenue", "roas",
-                         "trend_slope", "trend_confident", "delivery_declining", "recommendation"]],
-            use_container_width=True, hide_index=True,
-            column_config={
-                "ad": st.column_config.TextColumn("Ad", width="medium"),
-                "creative_type": "Type", "status_label": "Status",
-                "spend": st.column_config.NumberColumn("Spend", format="$%.0f"),
-                "revenue": st.column_config.NumberColumn("Revenue", format="$%.0f"),
-                "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
-                "trend_slope": st.column_config.NumberColumn("Trend (x/day)", format="%.3f"),
-                "trend_confident": st.column_config.CheckboxColumn("Trend trusted?"),
-                "delivery_declining": st.column_config.CheckboxColumn("Delivery declining?"),
-                "recommendation": st.column_config.TextColumn("Recommendation", width="large"),
-            },
-        )
-        csv_bytes = ads_df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download as CSV", data=csv_bytes,
-                            file_name=f"meta_ads_check_{date_max.isoformat()}.csv", mime="text/csv")
-
-    if hdg:
-        st.subheader("Inspect one ad")
-        pick_ad = st.selectbox("Ad", ads_df["ad"].tolist())
-        ad_daily = az.daily_rollup(df[df["ad"] == pick_ad], []).sort_values("day")
-        fig_roas, fig_ctr = ch.ad_roas_ctr_chart(
-            ad_daily["day"], ad_daily["roas"], ad_daily["ctr"], breakeven_roas, benchmark_roas
-        )
-        ac1, ac2, ac3 = st.columns(3)
-        ac1.plotly_chart(ch.daily_spend_chart(ad_daily), use_container_width=True)
-        ac2.plotly_chart(fig_roas, use_container_width=True)
-        ac3.plotly_chart(fig_ctr, use_container_width=True)
+    st.dataframe(rank_df[display_cols], use_container_width=True, hide_index=True, column_config=col_config)
+    csv_bytes = rank_df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download ranking as CSV", data=csv_bytes,
+                        file_name=f"meta_ads_ad_ranking_{date_max.isoformat()}.csv", mime="text/csv")
 
 # ---------------------------------------------------------------------------
 # TAB 4 — Methodology: every algorithm/model behind the app, in one place,
@@ -499,46 +579,51 @@ with tab_methodology:
 
     st.subheader("4. Budget allocation — Campaign & Ad set")
     st.markdown(
-        f"Same function, same logic, applied at both grains (`analysis.py::classify_budget_level`). "
-        f"With your current sidebar values (benchmark **{benchmark_roas:.2f}x**, break-even "
-        f"**{breakeven_roas:.2f}x**, minimum window spend **${min_window_spend:,.0f}**, minimum "
-        f"active days **{min_active_days}**):\n\n"
-        "1. **Data sufficiency first** — below the minimum active days or minimum spend → "
-        "`⚪ Insufficient data`, never judged as good or bad.\n"
-        "2. Otherwise, `decision_level` = fitted end-of-window ROAS (if the trend is trusted) or "
-        "blended window ROAS (if not).\n"
-        f"3. **🔴 Cut** if blended ROAS or `decision_level` is below break-even "
-        f"({breakeven_roas:.2f}x).\n"
-        f"4. **🟢 Scale** if `decision_level` is at/above the benchmark ({benchmark_roas:.2f}x).\n"
-        "5. **🔵 Maintain** otherwise."
+        f"Same function, same rule, applied at both grains and reused by the Hierarchy tab's mind "
+        f"map too (`analysis.py::classify_budget_level`). With your current sidebar values (cut "
+        f"today-spend **\\${cut_today_spend:.0f}**, cut cumulative spend **\\${cut_cumulative_spend:.0f}**, "
+        f"benchmark **{benchmark_roas:.2f}x**):\n\n"
+        f"1. **🔴 Cut** — today's spend is over \\${cut_today_spend:.0f}, or cumulative window spend "
+        f"is over \\${cut_cumulative_spend:.0f}, *and* zero sales on **each of the last "
+        f"{CUT_NO_SALES_DAYS} days** in the file.\n"
+        f"2. **🟢 Scale** — otherwise, if today's ROAS is at/above **{benchmark_roas:.2f}x**, or the "
+        "weighted-regression trend from section 3 is confidently improving.\n"
+        "3. **🔵 Maintain** — otherwise.\n\n"
+        "\"Today\" is the most recent calendar day in the *whole loaded file* (fixed once, not "
+        "per-entity — so an ad set with no rows on the last day still gets the correct \"today\" "
+        "and \"last N days\" reference instead of a stale one inferred from its own sparser data). "
+        "Needs daily data; single-window snapshots treat the whole window as \"today\" and skip the "
+        "no-sales-streak check (undefined for one data point), so Cut can only be reached there via "
+        "logic that never fires — meaning snapshot files only ever resolve to Scale or Maintain."
     )
 
-    st.subheader("5. Ad set anomaly detection — the ML model")
+    st.subheader("5. Anomaly detection — the ML model")
     st.markdown(
-        f"`analysis.py::detect_adset_anomalies`. Every ad-set-day is pooled together, then each "
-        "ad set's own **CTR and CPC are z-scored against its own history** (so 'unusual' means "
-        "unusual for that specific ad set, not just a bigger/smaller one in absolute terms). Those "
+        f"`analysis.py::detect_anomalies`, one grain finer at the Ad tab (`group_col=\"ad\"`) than "
+        "the Ad Set tab (`group_col=\"adset\"`) — same function either way. Every pooled (group, day) "
+        "has its own **CTR and CPC z-scored against that group's own history** (so 'unusual' means "
+        "unusual for that specific ad set/ad, not just a bigger/smaller one in absolute terms). Those "
         "two z-scores feed an **Isolation Forest** (`sklearn.ensemble.IsolationForest`, "
         f"`n_estimators=200`, `contamination={anomaly_sensitivity:.2f}` — your current *anomaly "
         "sensitivity* setting, `random_state=42` for reproducibility) fit across the pooled data — "
         "catching e.g. 'CPC drifted up *and* CTR drifted down together' even when neither alone "
         "crosses a hard threshold, which a per-metric rule can't see.\n\n"
-        "- Needs a pool of **30+ ad-set-days** (across all ad sets combined) for the model to be "
-        "meaningful. Below that it falls back to a simple **day-over-day % change rule** (CPC +50%, "
-        "or CTR -40%).\n"
+        "- Needs a pool of **30+ (group, day) rows** to be meaningful. Below that it falls back to a "
+        "simple **day-over-day % change rule** (CPC +50%, or CTR -40%).\n"
         "- Unavailable entirely for single-window snapshots (nothing to compare against).\n"
-        "- The model is trained on the **full pooled window**, but the chart only plots the "
-        "**latest day** — training needs multiple days per ad set to know what's normal, but the "
+        "- The model is trained on the **full pooled window**, but only the **latest day's** flags "
+        "are listed and plotted — training needs multiple days to know what's normal, but the "
         "actionable view is 'what's unusual right now,' not a history of anomalies that may have "
-        "already resolved."
+        "already resolved. The Ad tab's Anomalies section renders each flagged ad's latest-day "
+        "**funnel** (Impressions → Link clicks → Purchases) or its **daily trend**, your choice."
     )
 
-    st.subheader("6. Ad performance evaluation")
+    st.subheader("6. Ad performance evaluation & ranking")
     st.markdown(
         f"`analysis.py::classify_ads`. Same weighted-regression trend as above, per ad, checked in "
         "order — data sufficiency, then performance:\n\n"
         f"1. ⬜ **Insufficient history** — fewer than {min_active_days} active day(s).\n"
-        f"2. ⚪ **Low delivery** — total spend under ${min_window_spend:,.0f}; ROAS here is sampling "
+        f"2. ⚪ **Low delivery** — total spend under \\${min_window_spend:,.0f}; ROAS here is sampling "
         "noise, not signal.\n"
         f"3. 🔴 **Critical** — ROAS (or a trusted trend) below break-even ({breakeven_roas:.2f}x).\n"
         f"4. 🟠 **Warning** — trusted current level below {refresh_ratio:.0%} of benchmark "
@@ -549,21 +634,26 @@ with tab_methodology:
         "'this creative is underperforming' from 'this ad simply isn't being delivered anymore.' "
         "`creative_type` is a lightweight keyword tag inferred from the ad's own name (Feed/catalog, "
         "KOL/UGC, AI-generated, Static image, Video) — context for the ad-level view, not a "
-        "separate creative-level dataset or model."
+        "separate creative-level dataset or model.\n\n"
+        "The **Ranking** table is a plain sort, no model: pick **All days** (window rollup, plus "
+        "status/trend from above) or **Single day** (any date in the file, `window_rollup` on that "
+        "day's rows alone — no status/trend, those need multiple days). Each entry in **Sort by** "
+        "bundles a column with a direction, and multiple picks sort in the order chosen — the first "
+        "pick is primary, later picks only break ties within it."
     )
 
     st.subheader("7. Hierarchy view")
     st.markdown(
         "No model here — `charts.py::mind_map_level` renders one 'star' at a time (one parent, its "
-        "direct children below it, connected by lines), built from the same `window_rollup` used "
-        "elsewhere. Total → Campaigns renders first; picking a campaign renders a second star for its "
-        "Ad sets, and picking an ad set renders a third for its Ads. Kept to one small star per view, "
-        "rather than every level at once, on purpose — an earlier all-at-once version (a nested-box "
-        "'icicle' chart with the whole account rendered simultaneously) was hard to read at real "
-        "account scale and had a rendering bug where its legend overlapped the title. Node size = "
-        "spend; color = that node's own window ROAS against the break-even/benchmark thresholds "
-        "(`analysis.py::roas_bucket`) — window-level only, no trend, since a single star spans "
-        "several entities of the same type at once rather than one entity's history."
+        "direct children below it, connected by lines). Total → Campaigns renders first; picking a "
+        "campaign renders a second star for its Ad sets. Kept to one small star per view, rather than "
+        "every level at once, on purpose — an earlier all-at-once version (a nested-box 'icicle' "
+        "chart with the whole account rendered simultaneously) was hard to read at real account scale "
+        "and had a rendering bug where its legend overlapped the title. Node size = spend; color = "
+        "that node's own **Cut / Maintain / Scale** call from section 4 — the exact same function "
+        "and thresholds as the Campaign Budget and Ad Set Budget tabs, so a campaign or ad set is "
+        "colored identically everywhere in the app. Individual ads aren't part of this view — see the "
+        "🎨 Ad Performance tab instead."
     )
 
     st.subheader("8. Chart design choices")

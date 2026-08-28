@@ -284,23 +284,6 @@ def window_rollup(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Hierarchy drill-down — Total -> Campaign -> Ad set -> Ad, one level at a
-# time (a "mind map" star: one parent, its direct children). Every node's
-# own window ROAS decides its color bucket (Cut/Maintain/Scale), same
-# thresholds as the budget tabs. Window-level only (no trend) — works
-# identically for daily or snapshot files.
-# ---------------------------------------------------------------------------
-def roas_bucket(roas: float, benchmark_roas: float, breakeven_roas: float) -> str:
-    if pd.isna(roas):
-        return "Insufficient data"
-    if roas < breakeven_roas:
-        return "Cut"
-    if roas >= benchmark_roas:
-        return "Scale"
-    return "Maintain"
-
-
-# ---------------------------------------------------------------------------
 # Weighted-regression trend — the core statistical upgrade. Used identically
 # at the campaign, ad set, and ad level so "potential" means the same thing
 # everywhere: a spend-weighted linear fit of daily ROAS across every
@@ -345,124 +328,132 @@ def weighted_roas_trend(days: pd.Series, roas: pd.Series, weights: pd.Series,
 
 
 # ---------------------------------------------------------------------------
-# Budget allocation — Campaign AND Ad set (same function, different grain).
-# Falls back to a single-window threshold read when there's no day-over-day
-# data to fit a trend from.
+# Budget allocation — Campaign AND Ad set, same rule at both grains:
+#
+# 1. Cut — today's spend is over `cut_today_spend`, OR cumulative window
+#    spend is over `cut_cumulative_spend`, AND there have been zero sales on
+#    EACH of the last `cut_no_sales_days` calendar days in the file. Spend
+#    is being wasted with no recent payoff.
+# 2. Scale — otherwise, if today's ROAS is at/above the benchmark, OR the
+#    weighted-regression trend (same fit used elsewhere) is confidently
+#    improving. Either signal is a reason to push more budget in.
+# 3. Maintain — otherwise: no cut signal, no scale signal — typically a
+#    modest-spend entity where a quiet sales day isn't yet a red flag.
+#
+# Needs daily data for "today" and the no-sales-streak check. A single-
+# window snapshot has no "today" to isolate, so it treats the whole window
+# as today and the no-sales-streak check never fires (undefined for one
+# data point) — Cut can't trigger from that path in snapshot mode.
 # ---------------------------------------------------------------------------
 def classify_budget_level(
     df: pd.DataFrame,
     level_col: str,
     benchmark_roas: float,
     has_daily_granularity: bool = True,
-    breakeven_roas: float = 1.0,
-    min_window_spend: float = 15.0,
-    min_active_days: int = 3,
+    cut_today_spend: float = 50.0,
+    cut_cumulative_spend: float = 100.0,
+    cut_no_sales_days: int = 3,
     r2_threshold: float = 0.35,
+    reference_days: list | None = None,
 ) -> pd.DataFrame:
+    all_days = sorted(pd.to_datetime(pd.Series(reference_days)).unique()) if reference_days is not None \
+        else sorted(df["day"].unique())
+    latest_day = all_days[-1] if len(all_days) else None
+    last_n_days = all_days[-cut_no_sales_days:] if len(all_days) >= cut_no_sales_days else None
+
     rows = []
     for entity, g in df.groupby(level_col):
         g = g.sort_values("day")
         n_days = g["day"].nunique()
         total_spend = g["spend"].sum()
         total_revenue = g["revenue"].sum()
+        total_purchases = g["purchases"].sum()
         overall_roas = total_revenue / total_spend if total_spend > 0 else np.nan
-        overall_cpa = total_spend / g["purchases"].sum() if g["purchases"].sum() > 0 else np.nan
+        overall_cpa = total_spend / total_purchases if total_purchases > 0 else np.nan
 
-        base_row = {
-            level_col: entity, "active_days": n_days, "spend": total_spend, "revenue": total_revenue,
-            "roas": overall_roas, "cpa": overall_cpa, "trend_slope": np.nan, "trend_r2": np.nan,
-            "trend_confident": False, "decision_level": np.nan,
-        }
+        if has_daily_granularity and latest_day is not None:
+            today = g[g["day"] == latest_day]
+            today_spend = today["spend"].sum()
+            today_revenue = today["revenue"].sum()
+            today_roas = today_revenue / today_spend if today_spend > 0 else np.nan
+        else:
+            today_spend, today_roas = total_spend, overall_roas
 
-        day_gate_ok = n_days >= min_active_days if has_daily_granularity else True
-        if not day_gate_ok or total_spend < min_window_spend:
-            rows.append({**base_row, "recommendation": "Insufficient data",
-                         "rationale": f"Only {n_days} day(s) / ${total_spend:.0f} spend — not enough to judge."})
-            continue
+        no_sales_recent = False
+        if has_daily_granularity and last_n_days is not None:
+            purchases_by_day = g[g["day"].isin(last_n_days)].groupby("day")["purchases"].sum()
+            no_sales_recent = all(purchases_by_day.get(d, 0.0) == 0.0 for d in last_n_days)
 
-        if not has_daily_granularity:
-            if overall_roas < breakeven_roas:
-                rec, why = "Cut", f"ROAS {overall_roas:.2f}x is below break-even (single-window snapshot — no trend available)."
-            elif overall_roas >= benchmark_roas:
-                rec, why = "Scale", f"ROAS {overall_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark (single-window snapshot — no trend available)."
-            else:
-                rec, why = "Maintain", f"ROAS {overall_roas:.2f}x is between break-even and benchmark (single-window snapshot — no trend available)."
-            rows.append({**base_row, "decision_level": overall_roas, "recommendation": rec, "rationale": why})
-            continue
+        trend = Trend(n=0)
+        if has_daily_granularity:
+            daily = g.groupby("day")[["spend", "revenue"]].sum()
+            daily_roas = daily["revenue"] / daily["spend"].replace(0, np.nan)
+            trend = weighted_roas_trend(daily.index.to_series(), daily_roas, daily["spend"], r2_threshold=r2_threshold)
 
-        daily = g.groupby("day")[["spend", "revenue"]].sum()
-        daily_roas = daily["revenue"] / daily["spend"].replace(0, np.nan)
-        trend = weighted_roas_trend(daily.index.to_series(), daily_roas, daily["spend"], r2_threshold=r2_threshold)
+        cut_condition = (today_spend > cut_today_spend or total_spend > cut_cumulative_spend) and no_sales_recent
+        high_roi = pd.notna(today_roas) and today_roas >= benchmark_roas
+        good_trend = trend.confident and trend.slope_per_day > 0
 
-        decision_level = trend.fitted_end if trend.confident else overall_roas
-
-        if overall_roas < breakeven_roas or decision_level < breakeven_roas:
+        if cut_condition:
             rec = "Cut"
-            if trend.confident:
-                why = (f"Blended ROAS {overall_roas:.2f}x, and the fitted trend across all {trend.n} days is "
-                       f"confidently declining (R²={trend.r2:.2f}) toward {trend.fitted_end:.2f}x — projected below break-even.")
-            else:
-                why = f"Blended ROAS {overall_roas:.2f}x is below break-even."
-        elif decision_level >= benchmark_roas:
+            why = (f"${today_spend:.0f} spent today (${total_spend:.0f} cumulative) with zero sales across "
+                   f"the last {cut_no_sales_days} days — spend isn't converting.")
+        elif high_roi or good_trend:
             rec = "Scale"
-            if trend.confident:
-                why = (f"Fitted trend across all {trend.n} days is confidently rising (R²={trend.r2:.2f}, "
-                       f"{trend.fitted_start:.2f}x -> {trend.fitted_end:.2f}x) and at/above the {benchmark_roas:.1f}x benchmark.")
+            if high_roi:
+                why = f"Today's ROAS {today_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark."
             else:
-                why = (f"Blended ROAS {overall_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark; the day-to-day "
-                       f"pattern is too noisy to fit a confident trend (R²={trend.r2:.2f}), so this is based on the "
-                       "window average, not a direction.")
+                why = (f"Today's ROAS isn't yet at benchmark, but the trend across {trend.n} days is confidently "
+                       f"improving (R²={trend.r2:.2f}, {trend.slope_per_day:+.3f}x/day).")
         else:
             rec = "Maintain"
-            if trend.confident:
-                why = (f"Fitted trend across all {trend.n} days (R²={trend.r2:.2f}) puts current ROAS around "
-                       f"{trend.fitted_end:.2f}x — between break-even and the {benchmark_roas:.1f}x benchmark.")
-            else:
-                why = (f"Blended ROAS {overall_roas:.2f}x is between break-even and benchmark; the day-to-day pattern "
-                       f"is too noisy to fit a confident trend (R²={trend.r2:.2f}), so this is based on the window "
-                       "average, not a direction.")
+            why = (f"No cut or scale signal — today's spend (${today_spend:.0f}) and trend don't call for a "
+                   "change yet.")
 
         rows.append({
-            **base_row, "trend_slope": trend.slope_per_day, "trend_r2": trend.r2,
-            "trend_confident": trend.confident, "decision_level": decision_level,
-            "recommendation": rec, "rationale": why,
+            level_col: entity, "active_days": n_days, "spend": total_spend, "revenue": total_revenue,
+            "roas": overall_roas, "cpa": overall_cpa, "today_spend": today_spend, "today_roas": today_roas,
+            "no_sales_recent": no_sales_recent, "trend_slope": trend.slope_per_day, "trend_r2": trend.r2,
+            "trend_confident": trend.confident, "recommendation": rec, "rationale": why,
         })
     return pd.DataFrame(rows).sort_values("spend", ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Ad set anomaly detection — pooled multivariate outlier model (Isolation
-# Forest) across every ad-set-day, z-scored within each ad set first (so
-# "unusual" means unusual FOR THAT ad set, not just a bigger one). Falls
-# back to a simple day-over-day percent-change rule when there isn't enough
-# pooled data for a model to be meaningful, or no daily granularity at all.
+# Anomaly detection — pooled multivariate outlier model (Isolation Forest)
+# across every (group, day), z-scored within each group first (so "unusual"
+# means unusual FOR THAT ad set/ad, not just a bigger one). Works at either
+# grain via `group_col` ("adset" or "ad"). Falls back to a simple
+# day-over-day percent-change rule when there isn't enough pooled data for a
+# model to be meaningful, or no daily granularity at all.
 # ---------------------------------------------------------------------------
-def detect_adset_anomalies(
+def detect_anomalies(
     df: pd.DataFrame,
+    group_col: str,
     has_daily_granularity: bool = True,
     min_day_spend: float = 5.0,
     contamination: float = 0.08,
     min_rows_for_ml: int = 30,
-    min_days_per_adset: int = 3,
+    min_days_per_group: int = 3,
 ) -> tuple[pd.DataFrame, str, pd.DataFrame | None]:
     """Returns (flags_df, method, scored_pool). method is 'ml', 'heuristic', or
     'unavailable'. scored_pool (only set for 'ml') carries every pooled
-    ad-set-day with its z-scores and anomaly flag, for the scatter chart —
-    not just the flagged rows, so the chart can show normal points too."""
+    (group, day) with its z-scores and anomaly flag — not just the flagged
+    rows, so a scatter chart can show normal points too."""
     if not has_daily_granularity:
-        return pd.DataFrame(columns=["adset", "day", "type", "detail", "score"]), "unavailable", None
+        return pd.DataFrame(columns=[group_col, "day", "type", "detail", "score"]), "unavailable", None
 
-    daily = daily_rollup(df, ["adset"])
+    daily = daily_rollup(df, [group_col])
     daily = daily[daily["spend"] >= min_day_spend].copy()
 
-    eligible = daily.groupby("adset")["day"].transform("count") >= min_days_per_adset
+    eligible = daily.groupby(group_col)["day"].transform("count") >= min_days_per_group
     pool = daily[eligible].copy()
 
     if len(pool) >= min_rows_for_ml:
         from sklearn.ensemble import IsolationForest
 
-        pool["z_ctr"] = pool.groupby("adset")["ctr"].transform(lambda s: (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) > 0 else 0.0)
-        pool["z_cpc"] = pool.groupby("adset")["cpc"].transform(lambda s: (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) > 0 else 0.0)
+        pool["z_ctr"] = pool.groupby(group_col)["ctr"].transform(lambda s: (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) > 0 else 0.0)
+        pool["z_cpc"] = pool.groupby(group_col)["cpc"].transform(lambda s: (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) > 0 else 0.0)
         features = pool[["z_ctr", "z_cpc"]].fillna(0.0)
 
         model = IsolationForest(n_estimators=200, contamination=contamination, random_state=42)
@@ -475,41 +466,30 @@ def detect_adset_anomalies(
         for _, r in flagged.iterrows():
             reasons = []
             if abs(r["z_ctr"]) >= 1.0:
-                reasons.append(f"CTR {r['z_ctr']:+.1f}σ vs. this ad set's own average ({r['ctr']:.2f}%)")
+                reasons.append(f"CTR {r['z_ctr']:+.1f}σ vs. its own average ({r['ctr']:.2f}%)")
             if abs(r["z_cpc"]) >= 1.0:
-                reasons.append(f"CPC {r['z_cpc']:+.1f}σ vs. this ad set's own average (${r['cpc']:.2f})")
+                reasons.append(f"CPC {r['z_cpc']:+.1f}σ vs. its own average (${r['cpc']:.2f})")
             if not reasons:
-                reasons.append(f"CTR {r['ctr']:.2f}%, CPC ${r['cpc']:.2f} — unusual combination for this ad set")
-            flags.append({"adset": r["adset"], "day": r["day"], "type": "Anomaly",
+                reasons.append(f"CTR {r['ctr']:.2f}%, CPC ${r['cpc']:.2f} — unusual combination")
+            flags.append({group_col: r[group_col], "day": r["day"], "type": "Anomaly",
                           "detail": "; ".join(reasons), "score": r["score"]})
         return pd.DataFrame(flags), "ml", pool
 
     # Fallback: day-over-day percent change, too little pooled data for ML to be meaningful.
     flags = []
-    for adset, g in daily.groupby("adset"):
+    for key, g in daily.groupby(group_col):
         g = g.sort_values("day").reset_index(drop=True)
         if len(g) < 2:
             continue
         g["cpc_pct_change"] = g["cpc"].pct_change()
         g["ctr_pct_change"] = g["ctr"].pct_change()
         for _, r in g[g["cpc_pct_change"] > 0.5].iterrows():
-            flags.append({"adset": adset, "day": r["day"], "type": "CPC spike",
+            flags.append({group_col: key, "day": r["day"], "type": "CPC spike",
                           "detail": f"CPC +{r['cpc_pct_change']:.0%} to ${r['cpc']:.2f}", "score": np.nan})
         for _, r in g[g["ctr_pct_change"] < -0.4].iterrows():
-            flags.append({"adset": adset, "day": r["day"], "type": "CTR drop",
+            flags.append({group_col: key, "day": r["day"], "type": "CTR drop",
                           "detail": f"CTR {r['ctr_pct_change']:.0%} to {r['ctr']:.2f}%", "score": np.nan})
     return pd.DataFrame(flags), "heuristic", None
-
-
-def adset_summary(df: pd.DataFrame, anomalies: pd.DataFrame) -> pd.DataFrame:
-    summary = window_rollup(df, ["adset"])
-    if len(anomalies):
-        counts = anomalies.groupby("adset").size().rename("anomaly_count")
-        summary = summary.merge(counts, on="adset", how="left")
-    else:
-        summary["anomaly_count"] = 0
-    summary["anomaly_count"] = summary["anomaly_count"].fillna(0).astype(int)
-    return summary.sort_values("spend", ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
