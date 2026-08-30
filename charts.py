@@ -154,7 +154,7 @@ def ad_funnel(impressions, link_clicks, purchases, title):
 
 
 
-def mind_map_level(root_label, root_metrics, children, title, label_top_n=14):
+def mind_map_level(root_label, root_metrics, children, title, label_top_n=14, height=420):
     """A single top-down 'mind map' fan: one parent node at the top, a line
     down to each of its direct children below, children sized by spend and
     colored by their own Cut/Maintain/Scale bucket. `children` needs columns
@@ -234,7 +234,7 @@ def mind_map_level(root_label, root_metrics, children, title, label_top_n=14):
 
     layout = {k: v for k, v in BASE_LAYOUT.items() if k not in ("xaxis", "yaxis", "margin", "legend")}
     fig.update_layout(
-        **layout, title=title, height=420, margin=dict(l=10, r=10, t=50, b=20), showlegend=False,
+        **layout, title=title, height=height, margin=dict(l=10, r=10, t=50, b=20), showlegend=False,
         xaxis=dict(visible=False, range=[-n / 2 - 0.8, n / 2 + 0.8]),
         yaxis=dict(visible=False, range=[-0.42, 1.2]),
     )

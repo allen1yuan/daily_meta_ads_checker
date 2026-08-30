@@ -203,8 +203,9 @@ with tab_hierarchy:
             "as the Campaign Budget and Ad Set Budget tabs (see their methodology expanders), so a "
             "campaign or ad set is colored identically everywhere in the app. Hover any node for its "
             "full metrics.\n\n"
-            "**Pick a campaign** below to fan out its ad sets. Individual ads have their own tab — "
-            "🎨 Ad Performance."
+            "Every campaign's ad sets are fanned out below **at once** — scan for red (Cut) dots "
+            "across the whole account instead of checking one campaign at a time. Individual ads "
+            "have their own tab — 🎨 Ad Performance."
         )
 
     def _mind_map_roll(sub_df, level_col):
@@ -224,16 +225,43 @@ with tab_hierarchy:
     else:
         st.info("No campaigns with data to plot.")
 
-    hier_pick_campaign = st.selectbox("Drill into a campaign", hier_camp_roll["label"].tolist())
+    # Compute every campaign's ad-set breakdown once, so the Cut summary
+    # below and the chart grid after it are built from the same pass.
+    cut_flags, camp_figs = [], []
+    for camp_name in hier_camp_roll["label"]:
+        camp_sub_df = df[df["campaign"] == camp_name]
+        camp_row = hier_camp_roll.loc[hier_camp_roll["label"] == camp_name].iloc[0]
+        adset_roll = _mind_map_roll(camp_sub_df, "adset")
+        for _, r in adset_roll[adset_roll["bucket"] == "Cut"].iterrows():
+            cut_flags.append({"campaign": camp_name, "adset": r["label"], "spend": r["spend"],
+                               "roas": r["roas"], "rationale": r["rationale"]})
+        camp_figs.append((camp_name, ch.mind_map_level(
+            camp_name, camp_row, adset_roll, f"{camp_name} → Ad sets", label_top_n=6, height=320,
+        )))
 
-    hier_camp_df = df[df["campaign"] == hier_pick_campaign]
-    hier_camp_row = hier_camp_roll.loc[hier_camp_roll["label"] == hier_pick_campaign].iloc[0]
-    hier_adset_roll = _mind_map_roll(hier_camp_df, "adset")
-    fig2 = ch.mind_map_level(hier_pick_campaign, hier_camp_row, hier_adset_roll, f"{hier_pick_campaign} → Ad sets")
-    if fig2 is not None:
-        st.plotly_chart(fig2, use_container_width=True)
+    st.subheader("Ad sets to cut, across every campaign")
+    if cut_flags:
+        st.dataframe(
+            pd.DataFrame(cut_flags).sort_values("spend", ascending=False),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "campaign": "Campaign", "adset": "Ad set",
+                "spend": st.column_config.NumberColumn("Spend", format="$%.0f"),
+                "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
+                "rationale": st.column_config.TextColumn("Why", width="large"),
+            },
+        )
     else:
-        st.info("No ad sets under this campaign with data to plot.")
+        st.success("No ad sets flagged Cut right now.")
+
+    st.subheader("Every campaign's ad sets")
+    grid_cols = st.columns(2)
+    for i, (camp_name, fig_i) in enumerate(camp_figs):
+        with grid_cols[i % 2]:
+            if fig_i is not None:
+                st.plotly_chart(fig_i, use_container_width=True)
+            else:
+                st.caption(f"**{camp_name}** — no ad sets with data to plot.")
 
 # ---------------------------------------------------------------------------
 # TAB 1 — Campaign budget
@@ -644,16 +672,20 @@ with tab_methodology:
 
     st.subheader("7. Hierarchy view")
     st.markdown(
-        "No model here — `charts.py::mind_map_level` renders one 'star' at a time (one parent, its "
-        "direct children below it, connected by lines). Total → Campaigns renders first; picking a "
-        "campaign renders a second star for its Ad sets. Kept to one small star per view, rather than "
-        "every level at once, on purpose — an earlier all-at-once version (a nested-box 'icicle' "
-        "chart with the whole account rendered simultaneously) was hard to read at real account scale "
-        "and had a rendering bug where its legend overlapped the title. Node size = spend; color = "
-        "that node's own **Cut / Maintain / Scale** call from section 4 — the exact same function "
-        "and thresholds as the Campaign Budget and Ad Set Budget tabs, so a campaign or ad set is "
-        "colored identically everywhere in the app. Individual ads aren't part of this view — see the "
-        "🎨 Ad Performance tab instead."
+        "No model here — `charts.py::mind_map_level` renders one 'star' (one parent, its direct "
+        "children below it, connected by lines). Total → Campaigns renders first at full size; every "
+        "campaign's Ad sets star then renders **at once** in a two-column grid below, rather than one "
+        "campaign at a time behind a picker — the point is scanning for red (Cut) dots across the "
+        "whole account in one pass, not checking campaigns one by one. An earlier all-at-once version "
+        "(a nested-box 'icicle' chart with the whole account in a single chart) was hard to read at "
+        "real account scale and had a rendering bug where its legend overlapped the title; many small "
+        "stars side by side reads better than one giant one. Node size = spend; color = that node's "
+        "own **Cut / Maintain / Scale** call from section 4 — the exact same function and thresholds "
+        "as the Campaign Budget and Ad Set Budget tabs, so a campaign or ad set is colored identically "
+        "everywhere in the app. The **'Ad sets to cut'** table above the grid is the same underlying "
+        "data, pre-filtered to `bucket == \"Cut\"` and pooled across every campaign — for when you "
+        "want the names and numbers directly rather than spotting them visually. Individual ads "
+        "aren't part of this view — see the 🎨 Ad Performance tab instead."
     )
 
     st.subheader("8. Chart design choices")
