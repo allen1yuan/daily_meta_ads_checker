@@ -77,6 +77,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     ],
     "impressions": ["impressions"],
     "link_clicks": ["link clicks", "clicks (all)", "clicks"],
+    "add_to_cart": ["adds to cart", "add to cart", "website adds to cart", "adds to cart (facebook pixel)"],
     "ctr": ["ctr (link click-through rate)", "ctr (all)", "ctr", "link ctr"],
     "cpc": ["cpc (cost per link click)", "cpc (all)", "cpc"],
     "cpm": ["cpm (cost per 1,000 impressions)", "cpm"],
@@ -232,6 +233,15 @@ def load_and_standardize(raw: pd.DataFrame) -> LoadResult:
         col = resolved[field_name]
         df[field_name] = pd.to_numeric(working.get(col), errors="coerce").fillna(0.0) if col else 0.0
 
+    if resolved["add_to_cart"]:
+        df["add_to_cart"] = pd.to_numeric(working[resolved["add_to_cart"]], errors="coerce").fillna(0.0)
+    else:
+        df["add_to_cart"] = 0.0
+        notes.append(
+            "No 'Adds to cart' column found — the ads-to-close rule and the funnel-breakage check "
+            "that depend on it are unavailable; add it to your export to enable them."
+        )
+
     if totals_row_check is not None:
         summary_rows = totals_row_check.pop("summary_rows")
         computed_spend = df["spend"].sum()
@@ -263,10 +273,11 @@ def add_ratio_columns(g: pd.DataFrame) -> pd.DataFrame:
     g["cpc"] = np.where(g["link_clicks"] > 0, g["spend"] / g["link_clicks"], np.nan)
     g["cpm"] = np.where(g["impressions"] > 0, g["spend"] / g["impressions"] * 1000, np.nan)
     g["frequency"] = np.where(g["reach"] > 0, g["impressions"] / g["reach"], np.nan)
+    g["add_to_cart_rate"] = np.where(g["link_clicks"] > 0, g["add_to_cart"] / g["link_clicks"] * 100, np.nan)
     return g
 
 
-SUM_COLS = ["spend", "purchases", "revenue", "impressions", "link_clicks", "reach"]
+SUM_COLS = ["spend", "purchases", "revenue", "impressions", "link_clicks", "reach", "add_to_cart"]
 
 
 def daily_rollup(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
@@ -344,6 +355,25 @@ def weighted_roas_trend(days: pd.Series, roas: pd.Series, weights: pd.Series,
 # window snapshot has no "today" to isolate, so it treats the whole window
 # as today and the no-sales-streak check never fires (undefined for one
 # data point) — Cut can't trigger from that path in snapshot mode.
+#
+# Beyond the label, every entity also gets:
+# - `predicted_roi` — one-step-ahead extrapolation of the weighted-regression
+#   trend (fitted_end + slope_per_day) when the trend is confident, else the
+#   blended window ROAS. Not a separate model — it's the same trend line
+#   read one day further out, so its honesty is bounded by the same R² gate.
+# - `adjustment_pct` / `adjustment_usd` / `new_daily_budget` — how much to
+#   actually move the daily budget, not just which direction. Scale sizes
+#   the increase off how far `predicted_roi` clears the benchmark (capped at
+#   `max_adjust_pct`); Cut sizes the decrease off how much cumulative spend
+#   has already been wasted (50-90% — every Cut here already means "no sales
+#   in N days," so a shallow trim isn't the point); Maintain is $0.
+# - `backtest_predicted` / `backtest_actual` / `backtest_error_pct` — refit
+#   the trend on every day EXCEPT the most recent one, predict that held-out
+#   day, and compare to what actually happened. This is the "did our model
+#   call it right yesterday" feedback signal: a wide swing between
+#   `backtest_predicted` and `backtest_actual` is a reason to trust today's
+#   `predicted_roi` less and move the budget more conservatively next time.
+#   Needs 4+ days to attempt at all (NaN otherwise).
 # ---------------------------------------------------------------------------
 def classify_budget_level(
     df: pd.DataFrame,
@@ -355,6 +385,7 @@ def classify_budget_level(
     cut_no_sales_days: int = 3,
     r2_threshold: float = 0.35,
     reference_days: list | None = None,
+    max_adjust_pct: float = 0.5,
 ) -> pd.DataFrame:
     all_days = sorted(pd.to_datetime(pd.Series(reference_days)).unique()) if reference_days is not None \
         else sorted(df["day"].unique())
@@ -370,6 +401,7 @@ def classify_budget_level(
         total_purchases = g["purchases"].sum()
         overall_roas = total_revenue / total_spend if total_spend > 0 else np.nan
         overall_cpa = total_spend / total_purchases if total_purchases > 0 else np.nan
+        daily_spend_rate = total_spend / n_days if n_days > 0 else 0.0
 
         if has_daily_granularity and latest_day is not None:
             today = g[g["day"] == latest_day]
@@ -385,10 +417,29 @@ def classify_budget_level(
             no_sales_recent = all(purchases_by_day.get(d, 0.0) == 0.0 for d in last_n_days)
 
         trend = Trend(n=0)
+        daily = None
         if has_daily_granularity:
-            daily = g.groupby("day")[["spend", "revenue"]].sum()
+            daily = g.groupby("day")[["spend", "revenue"]].sum().sort_index()
             daily_roas = daily["revenue"] / daily["spend"].replace(0, np.nan)
             trend = weighted_roas_trend(daily.index.to_series(), daily_roas, daily["spend"], r2_threshold=r2_threshold)
+
+        predicted_roi = (max(0.0, trend.fitted_end + trend.slope_per_day) if trend.confident
+                         else (overall_roas if pd.notna(overall_roas) else np.nan))
+
+        # --- Backtest: refit excluding the last day, predict it, compare to what happened.
+        backtest_predicted = backtest_actual = backtest_error_pct = np.nan
+        if daily is not None and len(daily) >= 4:
+            prior, held_out = daily.iloc[:-1], daily.iloc[-1]
+            prior_roas = prior["revenue"] / prior["spend"].replace(0, np.nan)
+            trend_prior = weighted_roas_trend(prior.index.to_series(), prior_roas, prior["spend"], r2_threshold=r2_threshold)
+            gap_days = (daily.index[-1] - prior.index.max()).days
+            if trend_prior.confident:
+                backtest_predicted = max(0.0, trend_prior.fitted_end + trend_prior.slope_per_day * gap_days)
+            elif prior["spend"].sum() > 0:
+                backtest_predicted = prior["revenue"].sum() / prior["spend"].sum()
+            backtest_actual = held_out["revenue"] / held_out["spend"] if held_out["spend"] > 0 else np.nan
+            if pd.notna(backtest_predicted) and pd.notna(backtest_actual) and backtest_predicted > 0:
+                backtest_error_pct = (backtest_actual - backtest_predicted) / backtest_predicted
 
         cut_condition = (today_spend > cut_today_spend or total_spend > cut_cumulative_spend) and no_sales_recent
         high_roi = pd.notna(today_roas) and today_roas >= benchmark_roas
@@ -396,10 +447,14 @@ def classify_budget_level(
 
         if cut_condition:
             rec = "Cut"
+            severity = min(1.0, total_spend / max(cut_cumulative_spend, 1.0) / 2)
+            adjustment_pct = -(0.5 + 0.4 * severity)
             why = (f"${today_spend:.0f} spent today (${total_spend:.0f} cumulative) with zero sales across "
                    f"the last {cut_no_sales_days} days — spend isn't converting.")
         elif high_roi or good_trend:
             rec = "Scale"
+            headroom = (predicted_roi - benchmark_roas) / benchmark_roas if pd.notna(predicted_roi) and benchmark_roas > 0 else 0.05
+            adjustment_pct = min(max(headroom, 0.05), max_adjust_pct)
             if high_roi:
                 why = f"Today's ROAS {today_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark."
             else:
@@ -407,14 +462,22 @@ def classify_budget_level(
                        f"improving (R²={trend.r2:.2f}, {trend.slope_per_day:+.3f}x/day).")
         else:
             rec = "Maintain"
+            adjustment_pct = 0.0
             why = (f"No cut or scale signal — today's spend (${today_spend:.0f}) and trend don't call for a "
                    "change yet.")
+
+        adjustment_usd = daily_spend_rate * adjustment_pct
+        new_daily_budget = max(0.0, daily_spend_rate + adjustment_usd)
 
         rows.append({
             level_col: entity, "active_days": n_days, "spend": total_spend, "revenue": total_revenue,
             "roas": overall_roas, "cpa": overall_cpa, "today_spend": today_spend, "today_roas": today_roas,
             "no_sales_recent": no_sales_recent, "trend_slope": trend.slope_per_day, "trend_r2": trend.r2,
-            "trend_confident": trend.confident, "recommendation": rec, "rationale": why,
+            "trend_confident": trend.confident, "predicted_roi": predicted_roi,
+            "daily_spend_rate": daily_spend_rate, "adjustment_pct": adjustment_pct,
+            "adjustment_usd": adjustment_usd, "new_daily_budget": new_daily_budget,
+            "backtest_predicted": backtest_predicted, "backtest_actual": backtest_actual,
+            "backtest_error_pct": backtest_error_pct, "recommendation": rec, "rationale": why,
         })
     return pd.DataFrame(rows).sort_values("spend", ascending=False).reset_index(drop=True)
 
@@ -564,6 +627,127 @@ def classify_ads(
     status_order = {"critical": 0, "warning": 1, "low_delivery": 2, "insufficient_history": 3, "healthy": 4}
     out["_order"] = out["status"].map(status_order)
     return out.sort_values(["_order", "spend"], ascending=[True, False]).drop(columns="_order").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Ads to close — a customizable, per-category rule distinct from the status
+# buckets above: those ask "is this ad healthy," this asks "has this ad
+# spent enough with zero payoff and consistently bad metrics that it should
+# be turned off." All conditions together, not any one alone.
+# ---------------------------------------------------------------------------
+DEFAULT_CLOSE_THRESHOLDS = {"ctr_min": 5.0, "cpm_max": 70.0, "min_spend": 50.0, "require_zero_add_to_cart": True}
+
+
+def evaluate_ads_to_close(
+    df: pd.DataFrame,
+    category_thresholds: dict[str, dict],
+    has_add_to_cart: bool = True,
+    lookback_days: int = 3,
+    reference_days: list | None = None,
+    has_daily_granularity: bool = True,
+) -> pd.DataFrame:
+    """Per ad: flag 'Close' when cumulative spend clears that ad's category
+    threshold with zero purchases, AND its recent metrics (last
+    `lookback_days`, or the whole window for a snapshot) are bad at once —
+    low CTR, high CPM, and (when the file has it) zero add-to-cart."""
+    all_days = sorted(pd.to_datetime(pd.Series(reference_days)).unique()) if reference_days is not None \
+        else sorted(df["day"].unique())
+    recent_days = all_days[-lookback_days:] if has_daily_granularity and len(all_days) >= lookback_days else all_days
+
+    rows = []
+    for ad, g in df.groupby("ad"):
+        category = g["creative_type"].iloc[0]
+        th = category_thresholds.get(category, category_thresholds.get("_default", DEFAULT_CLOSE_THRESHOLDS))
+        total_spend = g["spend"].sum()
+        total_purchases = g["purchases"].sum()
+        total_add_to_cart = g["add_to_cart"].sum()
+
+        recent = g[g["day"].isin(recent_days)] if has_daily_granularity else g
+        recent_impr = recent["impressions"].sum()
+        recent_clicks = recent["link_clicks"].sum()
+        recent_spend = recent["spend"].sum()
+        recent_ctr = recent_clicks / recent_impr * 100 if recent_impr > 0 else np.nan
+        recent_cpm = recent_spend / recent_impr * 1000 if recent_impr > 0 else np.nan
+
+        ctr_min = th.get("ctr_min", DEFAULT_CLOSE_THRESHOLDS["ctr_min"])
+        cpm_max = th.get("cpm_max", DEFAULT_CLOSE_THRESHOLDS["cpm_max"])
+        spend_gate = total_spend >= th.get("min_spend", DEFAULT_CLOSE_THRESHOLDS["min_spend"])
+        no_purchase = total_purchases == 0
+        bad_ctr = pd.notna(recent_ctr) and recent_ctr < ctr_min
+        bad_cpm = pd.notna(recent_cpm) and recent_cpm > cpm_max
+        bad_cart = (total_add_to_cart == 0) if (has_add_to_cart and th.get("require_zero_add_to_cart", True)) else True
+
+        should_close = spend_gate and no_purchase and bad_ctr and bad_cpm and bad_cart
+
+        reasons = []
+        if spend_gate and no_purchase:
+            reasons.append(f"${total_spend:.0f} spent, 0 purchases")
+        if bad_ctr:
+            reasons.append(f"CTR {recent_ctr:.2f}% < {ctr_min:.1f}%")
+        if bad_cpm:
+            reasons.append(f"CPM ${recent_cpm:.0f} > ${cpm_max:.0f}")
+        if has_add_to_cart and total_add_to_cart == 0:
+            reasons.append("0 add-to-cart")
+
+        rows.append({
+            "ad": ad, "creative_type": category, "spend": total_spend, "purchases": total_purchases,
+            "add_to_cart": total_add_to_cart, "recent_ctr": recent_ctr, "recent_cpm": recent_cpm,
+            "should_close": should_close, "reasons": "; ".join(reasons),
+        })
+    return pd.DataFrame(rows).sort_values("spend", ascending=False).reset_index(drop=True)
+
+
+def suggest_close_thresholds(df: pd.DataFrame, benchmark_roas: float, breakeven_roas: float,
+                              min_spend: float = 15.0) -> pd.DataFrame:
+    """Data-driven starting point for the CTR/CPM thresholds above, not a
+    black-box model: for each creative type, split its ads into 'good'
+    (window ROAS >= benchmark) and 'bad' (window ROAS < break-even), both
+    with enough spend to be meaningful, then suggest the CTR floor as the
+    low end of what good ads still cleared (25th percentile) and the CPM
+    ceiling as the high end of what bad ads still sat under (75th
+    percentile). Needs 3+ ads on each side of a category to say anything —
+    NaN otherwise, rather than a guess dressed up as a finding."""
+    ad_roll = window_rollup(df, ["ad"]).merge(
+        df[["ad", "creative_type"]].drop_duplicates(), on="ad", how="left"
+    )
+    ad_roll = ad_roll[ad_roll["spend"] >= min_spend]
+
+    rows = []
+    for category, g in ad_roll.groupby("creative_type"):
+        good = g[g["roas"] >= benchmark_roas]
+        bad = g[g["roas"] < breakeven_roas]
+        rows.append({
+            "creative_type": category, "n_good": len(good), "n_bad": len(bad),
+            "suggested_ctr_min": good["ctr"].quantile(0.25) if len(good) >= 3 else np.nan,
+            "suggested_cpm_max": bad["cpm"].quantile(0.75) if len(bad) >= 3 else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def detect_funnel_breakage(df: pd.DataFrame, min_clicks: float = 20.0, ctr_percentile: float = 0.7) -> pd.DataFrame:
+    """Flags ads where people ARE clicking (CTR in the top band for this
+    file) but essentially nobody adds to cart despite meaningful click
+    volume — the classic signature of a broken landing page, wrong
+    destination URL, or a tracking/pixel problem, not a creative problem.
+    Distinct from the statistical CTR/CPC anomaly model: this is a fixed,
+    explainable rule about the shape of the funnel, not an outlier score."""
+    ad_roll = window_rollup(df, ["ad"]).merge(
+        df[["ad", "creative_type"]].drop_duplicates(), on="ad", how="left"
+    )
+    eligible = ad_roll[ad_roll["link_clicks"] >= min_clicks].copy()
+    if eligible.empty:
+        return pd.DataFrame(columns=["ad", "creative_type", "ctr", "link_clicks", "add_to_cart", "detail"])
+
+    ctr_threshold = eligible["ctr"].quantile(ctr_percentile)
+    flagged = eligible[(eligible["ctr"] >= ctr_threshold) & (eligible["add_to_cart"] == 0)].copy()
+    flagged["detail"] = flagged.apply(
+        lambda r: (f"CTR {r['ctr']:.2f}% (top {int((1 - ctr_percentile) * 100)}% of this file) with "
+                   f"{int(r['link_clicks'])} clicks but 0 add-to-cart — check landing page / tracking, "
+                   "not the creative"),
+        axis=1,
+    )
+    return flagged[["ad", "creative_type", "ctr", "link_clicks", "add_to_cart", "detail"]] \
+        .sort_values("link_clicks", ascending=False).reset_index(drop=True)
 
 
 def topline_kpis(df: pd.DataFrame) -> dict:

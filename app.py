@@ -30,6 +30,7 @@ STATUS_LABELS = {
 STATUS_ORDER = ["critical", "warning", "low_delivery", "insufficient_history", "healthy"]
 R2_THRESHOLD = 0.35  # weighted-regression trend must clear this fit quality to be trusted
 CUT_NO_SALES_DAYS = 3  # Campaign/Ad set cut rule: zero sales on each of the last N days
+CLOSE_CATEGORIES = ["Feed / catalog", "KOL/UGC", "AI-generated", "Static image", "Video", "Other"]
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,11 @@ cut_today_spend = st.sidebar.number_input(
 )
 cut_cumulative_spend = st.sidebar.number_input(
     "...or cumulative window spend over ($)", min_value=0.0, value=100.0, step=5.0,
+)
+max_adjust_pct = st.sidebar.slider(
+    "Max budget change per adjustment", 0.1, 1.0, 0.5, 0.05,
+    help="Caps how large a single Scale suggestion can be (as a fraction of current daily spend) so "
+         "a promising early trend doesn't translate into a wild budget swing in one move.",
 )
 
 
@@ -178,6 +184,52 @@ def _rec_counts_row(rec_df):
     c3.metric("🔴 Cut", int(counts.get("Cut", 0)))
 
 
+def _adjustment_section(budget_df, entity_col, entity_label):
+    fig_adj = ch.budget_adjustment_bar(budget_df, entity_col, f"Suggested daily budget change — {entity_label}")
+    if fig_adj is not None:
+        st.plotly_chart(fig_adj, use_container_width=True)
+    else:
+        st.info(f"Every {entity_label.lower()} is at Maintain right now — no budget changes suggested.")
+
+    backtestable = budget_df.dropna(subset=["backtest_predicted", "backtest_actual"])
+    if len(backtestable):
+        median_err = backtestable["backtest_error_pct"].abs().median()
+        verdict = "tight — today's predicted ROI is worth trusting" if median_err < 0.15 \
+            else "wide — treat today's suggested adjustment as a smaller first move, not the full amount"
+        st.caption(
+            f"📈 Backtest — refit the trend excluding the latest day, predict it, compare to what "
+            f"actually happened: {len(backtestable)} {entity_label.lower()}(s) had enough history to "
+            f"check. Median prediction error: **{median_err:.0%}** ({verdict})."
+        )
+    else:
+        st.caption("📈 Backtest needs 4+ days of history per entity — not enough yet in this file.")
+
+
+def _budget_full_table_config(entity_col, entity_label):
+    return {
+        entity_col: st.column_config.TextColumn(entity_label),
+        "active_days": st.column_config.NumberColumn("Days"),
+        "spend": st.column_config.NumberColumn("Spend", format="$%.0f"),
+        "revenue": st.column_config.NumberColumn("Revenue", format="$%.0f"),
+        "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
+        "cpa": st.column_config.NumberColumn("CPA", format="$%.2f"),
+        "predicted_roi": st.column_config.NumberColumn("Predicted ROI", format="%.2fx"),
+        "daily_spend_rate": st.column_config.NumberColumn("Current $/day", format="$%.0f"),
+        "adjustment_usd": st.column_config.NumberColumn("Suggested change", format="%+.0f"),
+        "new_daily_budget": st.column_config.NumberColumn("New $/day", format="$%.0f"),
+        "backtest_predicted": st.column_config.NumberColumn("Backtest: predicted", format="%.2fx"),
+        "backtest_actual": st.column_config.NumberColumn("Backtest: actual", format="%.2fx"),
+        "today_spend": st.column_config.NumberColumn("Today spend", format="$%.0f"),
+        "today_roas": st.column_config.NumberColumn("Today ROAS", format="%.2fx"),
+        "no_sales_recent": st.column_config.CheckboxColumn(f"No sales, {CUT_NO_SALES_DAYS}d"),
+        "trend_slope": st.column_config.NumberColumn("Trend (x/day)", format="%.3f"),
+        "trend_r2": st.column_config.NumberColumn("Trend fit (R²)", format="%.2f"),
+        "trend_confident": st.column_config.CheckboxColumn("Trend trusted?"),
+        "recommendation": st.column_config.TextColumn("Recommendation"),
+        "rationale": st.column_config.TextColumn("Why", width="large"),
+    }
+
+
 BUDGET_RULE_MD = (
     f"Checked in order, same rule for Campaigns and Ad sets:\n\n"
     f"1. 🔴 **Cut** — today's spend is over **\\${cut_today_spend:.0f}**, or cumulative window spend "
@@ -189,7 +241,15 @@ BUDGET_RULE_MD = (
     "3. 🔵 **Maintain** — otherwise: no cut signal, no scale signal.\n\n"
     "Needs daily data for \"today\" and the no-sales streak; single-window snapshots treat the whole "
     "window as today and skip the streak check (undefined for one data point) — Cut can't trigger "
-    "there."
+    "there.\n\n"
+    f"**How much, not just which way** — a **predicted ROI** (the trend one day further out, or the "
+    f"blended ROAS when the trend isn't trusted) sizes the move: Scale adds up to "
+    f"**{max_adjust_pct:.0%}** of the current daily rate, scaled by how far predicted ROI clears "
+    "benchmark; Cut removes 50-90%, scaled by how much has already been wasted (every Cut here is "
+    "already a 'no sales in days' situation, so a shallow trim isn't the point). The **backtest** "
+    "columns refit the trend excluding the latest day, predict it, and compare to what actually "
+    "happened — a big gap there is a reason to trust today's prediction less and move the budget "
+    "more conservatively next time."
 )
 
 # ---------------------------------------------------------------------------
@@ -213,6 +273,7 @@ with tab_hierarchy:
             sub_df, level_col, benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
             cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
             cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
+            max_adjust_pct=max_adjust_pct,
         )
         roll = roll.rename(columns={level_col: "label"})
         roll["bucket"] = roll["recommendation"]
@@ -274,6 +335,7 @@ with tab_campaign:
         df, "campaign", benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
         cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
         cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
+            max_adjust_pct=max_adjust_pct,
     )
     _rec_counts_row(camp_df)
 
@@ -296,25 +358,13 @@ with tab_campaign:
         c1.plotly_chart(ch.daily_spend_chart(daily_all), use_container_width=True)
         c2.plotly_chart(ch.daily_roas_chart(daily_all, breakeven_roas, benchmark_roas), use_container_width=True)
 
+    st.subheader("How much to adjust")
+    _adjustment_section(camp_df, "campaign", "Campaign")
+
     with st.expander("📋 Full campaign table"):
         st.dataframe(
             camp_df, use_container_width=True, hide_index=True,
-            column_config={
-                "campaign": st.column_config.TextColumn("Campaign"),
-                "active_days": st.column_config.NumberColumn("Days"),
-                "spend": st.column_config.NumberColumn("Spend", format="$%.0f"),
-                "revenue": st.column_config.NumberColumn("Revenue", format="$%.0f"),
-                "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
-                "cpa": st.column_config.NumberColumn("CPA", format="$%.2f"),
-                "today_spend": st.column_config.NumberColumn("Today spend", format="$%.0f"),
-                "today_roas": st.column_config.NumberColumn("Today ROAS", format="%.2fx"),
-                "no_sales_recent": st.column_config.CheckboxColumn(f"No sales, {CUT_NO_SALES_DAYS}d"),
-                "trend_slope": st.column_config.NumberColumn("Trend (x/day)", format="%.3f"),
-                "trend_r2": st.column_config.NumberColumn("Trend fit (R²)", format="%.2f"),
-                "trend_confident": st.column_config.CheckboxColumn("Trend trusted?"),
-                "recommendation": st.column_config.TextColumn("Recommendation"),
-                "rationale": st.column_config.TextColumn("Why", width="large"),
-            },
+            column_config=_budget_full_table_config("campaign", "Campaign"),
         )
 
 # ---------------------------------------------------------------------------
@@ -336,6 +386,7 @@ with tab_adset:
         df, "adset", benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
         cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
         cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
+            max_adjust_pct=max_adjust_pct,
     )
     _rec_counts_row(adset_budget)
 
@@ -380,25 +431,13 @@ with tab_adset:
     else:
         st.success("No anomalies detected at the current thresholds.")
 
+    st.subheader("How much to adjust")
+    _adjustment_section(adset_budget, "adset", "Ad set")
+
     with st.expander("📋 Full ad set table"):
         st.dataframe(
             adset_budget, use_container_width=True, hide_index=True,
-            column_config={
-                "adset": st.column_config.TextColumn("Ad set"),
-                "active_days": st.column_config.NumberColumn("Days"),
-                "spend": st.column_config.NumberColumn("Spend", format="$%.0f"),
-                "revenue": st.column_config.NumberColumn("Revenue", format="$%.0f"),
-                "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
-                "cpa": st.column_config.NumberColumn("CPA", format="$%.2f"),
-                "today_spend": st.column_config.NumberColumn("Today spend", format="$%.0f"),
-                "today_roas": st.column_config.NumberColumn("Today ROAS", format="%.2fx"),
-                "no_sales_recent": st.column_config.CheckboxColumn(f"No sales, {CUT_NO_SALES_DAYS}d"),
-                "trend_slope": st.column_config.NumberColumn("Trend (x/day)", format="%.3f"),
-                "trend_r2": st.column_config.NumberColumn("Trend fit (R²)", format="%.2f"),
-                "trend_confident": st.column_config.CheckboxColumn("Trend trusted?"),
-                "recommendation": st.column_config.TextColumn("Recommendation"),
-                "rationale": st.column_config.TextColumn("Why", width="large"),
-            },
+            column_config=_budget_full_table_config("adset", "Ad set"),
         )
 
 # ---------------------------------------------------------------------------
@@ -410,12 +449,18 @@ with tab_ad:
             "**Status** (Critical/Warning/Healthy, shown below and available in the ranking table) "
             "checks data sufficiency before performance, same as before — see `classify_ads` in the "
             "Methodology tab.\n\n"
-            "**Anomalies** — every pooled ad-day's CTR and CPC are z-scored *within that ad's own "
-            "history*, then a multivariate outlier model (Isolation Forest) flags days that are "
-            "jointly unusual — same approach as the Ad Set tab, applied one grain finer. Needs 30+ "
-            "pooled ad-days to be meaningful; falls back to a day-over-day percent-change rule below "
-            "that, and is unavailable for single-window snapshots."
+            "**Ads to close** — a stricter, customizable rule: cumulative spend past a floor with "
+            "zero purchases, *and* recent CTR/CPM/add-to-cart are all bad at once, per ad category. "
+            "All conditions together, not any one alone.\n\n"
+            "**Setup / landing page issues** — high CTR (people ARE clicking) but ~0 add-to-cart "
+            "despite real click volume: usually a broken page or tracking, not the creative. Distinct "
+            "from the statistical anomalies below.\n\n"
+            "**Statistical anomalies** — every pooled ad-day's CTR and CPC are z-scored *within that "
+            "ad's own history*, then a multivariate outlier model (Isolation Forest) flags days that "
+            "are jointly unusual — same approach as the Ad Set tab, one grain finer."
         )
+
+    has_add_to_cart = result.resolved.get("add_to_cart") is not None
 
     ads_df = az.classify_ads(
         df, benchmark_roas=benchmark_roas, has_daily_granularity=hdg, breakeven_roas=breakeven_roas,
@@ -431,9 +476,100 @@ with tab_ad:
     s5.metric("⬜ Insufficient", int(status_counts.get("insufficient_history", 0)))
 
     # -------------------------------------------------------------------
-    # Anomalies — list only the flagged ads, not all of them
+    # Ads to close — customizable per-category thresholds
     # -------------------------------------------------------------------
-    st.subheader("Anomalies")
+    st.subheader("Ads to close")
+    with st.expander("⚙️ Customize thresholds per ad category"):
+        if not has_add_to_cart:
+            st.caption("No 'Adds to cart' column in this file — the close rule runs on spend/purchases/CTR/CPM only.")
+        if st.button("💡 Suggest CTR/CPM thresholds from this file's history"):
+            suggestions = az.suggest_close_thresholds(df, benchmark_roas, breakeven_roas, min_spend=min_window_spend)
+            applied = []
+            for _, r in suggestions.iterrows():
+                cat = r["creative_type"]
+                if cat not in CLOSE_CATEGORIES:
+                    continue
+                if pd.notna(r["suggested_ctr_min"]):
+                    st.session_state[f"close_ctr_{cat}"] = round(float(r["suggested_ctr_min"]), 2)
+                    applied.append(cat)
+                if pd.notna(r["suggested_cpm_max"]):
+                    st.session_state[f"close_cpm_{cat}"] = round(float(r["suggested_cpm_max"]), 2)
+            if applied:
+                st.success(f"Updated CTR/CPM for: {', '.join(applied)}. Categories with too few good/bad "
+                           "ads in this file keep their current values.")
+            else:
+                st.warning("Not enough ads with clearly good or clearly bad ROAS in any category yet — "
+                           "keeping current thresholds.")
+
+        hc1, hc2, hc3, hc4 = st.columns([2, 1, 1, 1])
+        hc1.caption("Category"); hc2.caption("CTR min (%)"); hc3.caption("CPM max ($)"); hc4.caption("Min spend ($)")
+        category_thresholds = {}
+        for cat in CLOSE_CATEGORIES:
+            st.session_state.setdefault(f"close_ctr_{cat}", az.DEFAULT_CLOSE_THRESHOLDS["ctr_min"])
+            st.session_state.setdefault(f"close_cpm_{cat}", az.DEFAULT_CLOSE_THRESHOLDS["cpm_max"])
+            st.session_state.setdefault(f"close_spend_{cat}", az.DEFAULT_CLOSE_THRESHOLDS["min_spend"])
+            r1, r2, r3, r4 = st.columns([2, 1, 1, 1])
+            r1.markdown(cat)
+            ctr_v = r2.number_input(cat + " CTR", min_value=0.0, step=0.5, key=f"close_ctr_{cat}", label_visibility="collapsed")
+            cpm_v = r3.number_input(cat + " CPM", min_value=0.0, step=5.0, key=f"close_cpm_{cat}", label_visibility="collapsed")
+            spend_v = r4.number_input(cat + " spend", min_value=0.0, step=5.0, key=f"close_spend_{cat}", label_visibility="collapsed")
+            category_thresholds[cat] = {"ctr_min": ctr_v, "cpm_max": cpm_v, "min_spend": spend_v,
+                                         "require_zero_add_to_cart": True}
+        category_thresholds["_default"] = az.DEFAULT_CLOSE_THRESHOLDS
+
+    close_df = az.evaluate_ads_to_close(
+        df, category_thresholds, has_add_to_cart=has_add_to_cart, lookback_days=CUT_NO_SALES_DAYS,
+        reference_days=all_window_days, has_daily_granularity=hdg,
+    )
+    to_close = close_df[close_df["should_close"]]
+    if len(to_close):
+        st.error(f"🔴 {len(to_close)} ad(s) meet every close condition at once — spend, zero purchases, "
+                 "and bad recent CTR/CPM" + (", zero add-to-cart" if has_add_to_cart else "") + ".")
+        st.dataframe(
+            to_close[["ad", "creative_type", "spend", "purchases", "add_to_cart", "recent_ctr", "recent_cpm", "reasons"]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "ad": st.column_config.TextColumn("Ad", width="medium"), "creative_type": "Type",
+                "spend": st.column_config.NumberColumn("Spend", format="$%.0f"),
+                "purchases": st.column_config.NumberColumn("Purchases"),
+                "add_to_cart": st.column_config.NumberColumn("Add to cart"),
+                "recent_ctr": st.column_config.NumberColumn("Recent CTR", format="%.2f%%"),
+                "recent_cpm": st.column_config.NumberColumn("Recent CPM", format="$%.0f"),
+                "reasons": st.column_config.TextColumn("Why", width="large"),
+            },
+        )
+    else:
+        st.success("No ads meet every close condition right now — loosen the thresholds above if this feels too strict.")
+
+    # -------------------------------------------------------------------
+    # Setup / landing page issues — a rule, not a statistical model
+    # -------------------------------------------------------------------
+    st.subheader("Setup / landing page issues")
+    funnel_break_ads = set()
+    if not has_add_to_cart:
+        st.info("Needs an 'Adds to cart' column in the export — not present in this file, so this "
+                 "check is unavailable.")
+    else:
+        funnel_breaks = az.detect_funnel_breakage(df, min_clicks=20.0, ctr_percentile=0.7)
+        funnel_break_ads = set(funnel_breaks["ad"])
+        if len(funnel_breaks):
+            for _, r in funnel_breaks.head(6).iterrows():
+                with st.expander(f"{r['ad']}  —  {r['detail']}"):
+                    ad_rows = df[df["ad"] == r["ad"]]
+                    stages = [
+                        ("Impressions", ad_rows["impressions"].sum()), ("Link clicks", ad_rows["link_clicks"].sum()),
+                        ("Add to cart", ad_rows["add_to_cart"].sum()), ("Purchases", ad_rows["purchases"].sum()),
+                    ]
+                    st.plotly_chart(ch.ad_funnel(stages, r["ad"], broken_stage_idx=2), use_container_width=True)
+            if len(funnel_breaks) > 6:
+                st.caption(f"Showing 6 of {len(funnel_breaks)} flagged ads.")
+        else:
+            st.success("No high-CTR/zero-cart ads detected at the current click threshold.")
+
+    # -------------------------------------------------------------------
+    # Statistical anomalies — list only the flagged ads, not all of them
+    # -------------------------------------------------------------------
+    st.subheader("Statistical anomalies")
     ad_anomalies, ad_method, ad_pool = az.detect_anomalies(
         df, "ad", has_daily_granularity=hdg, contamination=anomaly_sensitivity
     )
@@ -473,9 +609,13 @@ with tab_ad:
                     latest_row = ad_daily[ad_daily["day"] == flag_row["day"]]
                     if len(latest_row):
                         r = latest_row.iloc[0]
+                        stages = [("Impressions", r["impressions"]), ("Link clicks", r["link_clicks"])]
+                        if has_add_to_cart:
+                            stages.append(("Add to cart", r["add_to_cart"]))
+                        stages.append(("Purchases", r["purchases"]))
+                        broken_idx = (len(stages) - 2) if ad_name in funnel_break_ads else None
                         st.plotly_chart(
-                            ch.ad_funnel(r["impressions"], r["link_clicks"], r["purchases"],
-                                         f"{ad_name} — {flag_row['day'].date()}"),
+                            ch.ad_funnel(stages, f"{ad_name} — {flag_row['day'].date()}", broken_stage_idx=broken_idx),
                             use_container_width=True,
                         )
                 else:
@@ -489,7 +629,8 @@ with tab_ad:
             st.caption(f"Showing the top 8 of {len(flagged_today)} flagged ads.")
 
     # -------------------------------------------------------------------
-    # Ranking — every ad, sortable on multiple columns in priority order
+    # Ranking — every ad, overall and within its category, sortable on
+    # multiple columns in priority order
     # -------------------------------------------------------------------
     st.subheader("Ranking")
     rank_mode = st.radio("Metrics from", ["All days (window)", "Single day"], horizontal=True, key="ad_rank_mode")
@@ -508,8 +649,12 @@ with tab_ad:
         )
         is_all_days = True
 
+    rank_df["rank_overall"] = rank_df["roas"].rank(ascending=False, method="min").astype("Int64")
+    rank_df["rank_in_category"] = rank_df.groupby("creative_type")["roas"].rank(ascending=False, method="min").astype("Int64")
+
     sort_cols = [("spend", "Spend"), ("revenue", "Revenue"), ("roas", "ROAS"), ("cpa", "CPA"),
-                 ("ctr", "CTR"), ("cpc", "CPC"), ("cpm", "CPM")]
+                 ("ctr", "CTR"), ("cpc", "CPC"), ("cpm", "CPM"), ("rank_overall", "Rank overall"),
+                 ("rank_in_category", "Rank in category")]
     if is_all_days:
         sort_cols += [("active_days", "Active days"), ("trend_slope", "Trend (x/day)")]
     sort_options = {}
@@ -530,9 +675,12 @@ with tab_ad:
     else:
         rank_df = rank_df.sort_values("spend", ascending=False)
 
-    display_cols = ["ad", "creative_type", "spend", "revenue", "roas", "cpa", "ctr", "cpc"]
+    display_cols = ["ad", "creative_type", "rank_overall", "rank_in_category", "spend", "revenue",
+                     "roas", "cpa", "ctr", "cpc"]
     col_config = {
         "ad": st.column_config.TextColumn("Ad", width="medium"), "creative_type": "Type",
+        "rank_overall": st.column_config.NumberColumn("Rank"),
+        "rank_in_category": st.column_config.NumberColumn("Rank in category"),
         "spend": st.column_config.NumberColumn("Spend", format="$%.0f"),
         "revenue": st.column_config.NumberColumn("Revenue", format="$%.0f"),
         "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
@@ -605,12 +753,12 @@ with tab_methodology:
         "trusted and driving the call, hollow = too noisy, call rests on the ROAS level alone."
     )
 
-    st.subheader("4. Budget allocation — Campaign & Ad set")
+    st.subheader("4. Budget allocation, predicted ROI & day-over-day tuning — Campaign & Ad set")
     st.markdown(
         f"Same function, same rule, applied at both grains and reused by the Hierarchy tab's mind "
         f"map too (`analysis.py::classify_budget_level`). With your current sidebar values (cut "
         f"today-spend **\\${cut_today_spend:.0f}**, cut cumulative spend **\\${cut_cumulative_spend:.0f}**, "
-        f"benchmark **{benchmark_roas:.2f}x**):\n\n"
+        f"benchmark **{benchmark_roas:.2f}x**, max adjustment **{max_adjust_pct:.0%}**):\n\n"
         f"1. **🔴 Cut** — today's spend is over \\${cut_today_spend:.0f}, or cumulative window spend "
         f"is over \\${cut_cumulative_spend:.0f}, *and* zero sales on **each of the last "
         f"{CUT_NO_SALES_DAYS} days** in the file.\n"
@@ -622,10 +770,25 @@ with tab_methodology:
         "and \"last N days\" reference instead of a stale one inferred from its own sparser data). "
         "Needs daily data; single-window snapshots treat the whole window as \"today\" and skip the "
         "no-sales-streak check (undefined for one data point), so Cut can only be reached there via "
-        "logic that never fires — meaning snapshot files only ever resolve to Scale or Maintain."
+        "logic that never fires — meaning snapshot files only ever resolve to Scale or Maintain.\n\n"
+        "**Predicted ROI** is the same weighted-regression trend from section 3, read one day further "
+        "out (`fitted_end + slope_per_day`) when it's confident, or the blended window ROAS when it "
+        "isn't — not a separate model, so it inherits the same R² honesty gate.\n\n"
+        f"**How much to adjust** (`adjustment_usd`, sized off the current daily spend rate): Scale "
+        f"adds up to **{max_adjust_pct:.0%}** of it, scaled by how far predicted ROI clears the "
+        "benchmark; Cut removes 50-90%, scaled by how much cumulative spend has already been wasted "
+        "(every Cut here already means \"no sales in N days,\" so a shallow trim understates it); "
+        "Maintain suggests \\$0.\n\n"
+        "**Day-over-day tuning (backtest)** — refit the trend on every day *except* the most recent "
+        "one, predict that held-out day, and compare to what actually happened "
+        "(`backtest_predicted` / `backtest_actual` / `backtest_error_pct`). This is the app checking "
+        "its own most recent call against reality: a tight match means today's predicted ROI is "
+        "trustworthy; a wide gap is a signal to size the next adjustment more conservatively than the "
+        "formula alone suggests. Needs 4+ days of history to attempt; the tab shows the median "
+        "absolute error across every entity with enough history."
     )
 
-    st.subheader("5. Anomaly detection — the ML model")
+    st.subheader("5. Statistical anomaly detection — the ML model")
     st.markdown(
         f"`analysis.py::detect_anomalies`, one grain finer at the Ad tab (`group_col=\"ad\"`) than "
         "the Ad Set tab (`group_col=\"adset\"`) — same function either way. Every pooled (group, day) "
@@ -642,14 +805,15 @@ with tab_methodology:
         "- The model is trained on the **full pooled window**, but only the **latest day's** flags "
         "are listed and plotted — training needs multiple days to know what's normal, but the "
         "actionable view is 'what's unusual right now,' not a history of anomalies that may have "
-        "already resolved. The Ad tab's Anomalies section renders each flagged ad's latest-day "
-        "**funnel** (Impressions → Link clicks → Purchases) or its **daily trend**, your choice."
+        "already resolved. The Ad tab's Statistical anomalies section renders each flagged ad's "
+        "latest-day **funnel** or its **daily trend**, your choice — this is one of three distinct "
+        "ad-level signals; see sections 6 for the other two."
     )
 
-    st.subheader("6. Ad performance evaluation & ranking")
+    st.subheader("6. Ads to close, setup issues & ranking")
     st.markdown(
-        f"`analysis.py::classify_ads`. Same weighted-regression trend as above, per ad, checked in "
-        "order — data sufficiency, then performance:\n\n"
+        f"`analysis.py::classify_ads` still runs first — same weighted-regression trend as above, "
+        "checked in order, data sufficiency before performance:\n\n"
         f"1. ⬜ **Insufficient history** — fewer than {min_active_days} active day(s).\n"
         f"2. ⚪ **Low delivery** — total spend under \\${min_window_spend:,.0f}; ROAS here is sampling "
         "noise, not signal.\n"
@@ -657,17 +821,30 @@ with tab_methodology:
         f"4. 🟠 **Warning** — trusted current level below {refresh_ratio:.0%} of benchmark "
         f"({benchmark_roas * refresh_ratio:.2f}x) — your current *ad refresh trigger*.\n"
         "5. 🟢 **Healthy** — everything else.\n\n"
-        "Alongside status, each ad also gets a **delivery-declining** flag — the most recent 1-2 "
-        "days' average spend compared against the ad's peak daily spend in the window — to separate "
-        "'this creative is underperforming' from 'this ad simply isn't being delivered anymore.' "
-        "`creative_type` is a lightweight keyword tag inferred from the ad's own name (Feed/catalog, "
-        "KOL/UGC, AI-generated, Static image, Video) — context for the ad-level view, not a "
-        "separate creative-level dataset or model.\n\n"
-        "The **Ranking** table is a plain sort, no model: pick **All days** (window rollup, plus "
-        "status/trend from above) or **Single day** (any date in the file, `window_rollup` on that "
-        "day's rows alone — no status/trend, those need multiple days). Each entry in **Sort by** "
-        "bundles a column with a direction, and multiple picks sort in the order chosen — the first "
-        "pick is primary, later picks only break ties within it."
+        "Also computes a **delivery-declining** flag (recent 1-2 days' spend vs. the ad's peak daily "
+        "spend) and `creative_type` — a lightweight keyword tag from the ad's own name (Feed/catalog, "
+        "KOL/UGC, AI-generated, Static image, Video), not a separate creative-level dataset.\n\n"
+        "**Ads to close** (`analysis.py::evaluate_ads_to_close`) is a stricter, separate rule: "
+        "cumulative spend past a **per-category** floor with zero purchases, *and* the last "
+        f"{CUT_NO_SALES_DAYS} days' CTR/CPM/add-to-cart are **all** bad at once — every condition "
+        "together, not any one alone, so a single rough metric on an otherwise-fine ad doesn't trigger "
+        "it. Thresholds are editable per category in the tab; **'Suggest from history'** "
+        "(`suggest_close_thresholds`) is a simple, explainable split, not a black-box fit: for each "
+        "category it takes ads with window ROAS at/above your benchmark ('good') and below break-even "
+        "('bad'), both with enough spend, and suggests the CTR floor as the 25th percentile of what "
+        "good ads still cleared, and the CPM ceiling as the 75th percentile of what bad ads still sat "
+        "under. Needs 3+ ads on each side of a category to say anything.\n\n"
+        "**Setup / landing page issues** (`analysis.py::detect_funnel_breakage`) is a third, distinct "
+        "signal from the statistical anomaly model: ads whose CTR is in the top 30% of the file *and* "
+        "whose add-to-cart is exactly zero despite real click volume (20+ clicks) — traffic is "
+        "arriving but the funnel breaks immediately after, which usually means the landing page, "
+        "destination URL, or pixel is broken rather than the creative underperforming. Needs the "
+        "file's 'Adds to cart' column.\n\n"
+        "**Ranking** is a plain sort, no model: pick **All days** (window rollup, plus status/trend) "
+        "or **Single day** (any date, rolled up on that day's rows alone). `rank_overall` and "
+        "`rank_in_category` are a straight ROAS rank (1 = best), computed fresh for whichever mode is "
+        "active. Each **Sort by** entry bundles a column with a direction, and multiple picks sort in "
+        "the order chosen — the first pick is primary, later picks only break ties within it."
     )
 
     st.subheader("7. Hierarchy view")
@@ -699,7 +876,16 @@ with tab_methodology:
         "other point near zero. The axis is ranged to the 2nd-98th percentile of trend values "
         "instead of the true min/max; the point itself still plots at its real value (visible on "
         "hover), it just doesn't dictate the scale for everyone else.\n"
-        "- **Latest-day anomaly view** — see section 5 above."
+        "- **Diverging budget bar** (`charts.py::budget_adjustment_bar`, Campaign/Ad set tabs) — green "
+        "bars right (Scale, \\$ to add), red bars left (Cut, \\$ to remove), Maintain (\\$0) entities "
+        "excluded since a zero-length bar carries no information. Sorted by |adjustment| so the "
+        "biggest moves are at the top.\n"
+        "- **Funnel** (`charts.py::ad_funnel`, Ad tab) — each transition's text shows percent of the "
+        "*prior* stage, not just percent of impressions, so a specific weak link is readable without "
+        "mental math. A stage colored red (with a title warning) means that ad was flagged by the "
+        "setup/landing-page rule in section 6, not the funnel chart doing its own diagnosis — the "
+        "chart visualizes the finding, the rule makes it.\n"
+        "- **Latest-day anomaly/setup views** — see sections 5-6 above."
     )
 
     st.subheader("Libraries")

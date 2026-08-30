@@ -136,20 +136,65 @@ def anomaly_scatter(pool_df, group_col="adset", title="Anomaly detection (CTR vs
     return fig
 
 
-def ad_funnel(impressions, link_clicks, purchases, title):
-    """A single ad's latest-day funnel: Impressions -> Link clicks ->
-    Purchases. No cartesian axes needed for a funnel trace, so — same lesson
-    as the mind map — they're excluded from the layout rather than risking
-    a stray axis bleeding into the chart."""
+def budget_adjustment_bar(df, entity_col, title, top_n=20):
+    """How much to actually move the budget, not just which direction:
+    a diverging bar per entity, green bars extending right (Scale, $ to
+    add) and red bars extending left (Cut, $ to remove). Maintain ($0)
+    rows are excluded — a zero-length bar carries no information, only
+    clutter. Sorted by |adjustment| so the biggest moves are at the top."""
+    d = df[df["adjustment_usd"] != 0].copy()
+    if d.empty:
+        return None
+    d = d.reindex(d["adjustment_usd"].abs().sort_values(ascending=True).index).tail(top_n)
+    colors = [STATUS["good"] if v > 0 else STATUS["critical"] for v in d["adjustment_usd"]]
+    fig = go.Figure(go.Bar(
+        x=d["adjustment_usd"], y=[str(t)[:30] for t in d[entity_col]], orientation="h",
+        marker_color=colors,
+        customdata=np.stack([d[entity_col], d["daily_spend_rate"], d["new_daily_budget"]], axis=-1),
+        hovertemplate="<b>%{customdata[0]}</b><br>Current $%{customdata[1]:,.0f}/day → "
+                      "New $%{customdata[2]:,.0f}/day<br>Change %{x:+,.0f}/day<extra></extra>",
+        text=[f"{v:+,.0f}/day" for v in d["adjustment_usd"]], textposition="outside",
+    ))
+    fig.add_vline(x=0, line_color=INK["baseline"], line_width=1)
+    fig.update_layout(**BASE_LAYOUT, title=title, xaxis_title="Suggested daily budget change (USD)",
+                       height=max(320, 30 * len(d)), showlegend=False)
+    return fig
+
+
+def ad_funnel(stages, title, broken_stage_idx=None):
+    """A single ad's funnel across whatever stages are available for it —
+    Impressions -> Link clicks -> (Add to cart) -> Purchases. `stages` is a
+    list of (label, value) pairs, already in funnel order. Each transition's
+    conversion rate is spelled out in the bar text (percent of the previous
+    stage, not just percent of the top) so a specific weak link is visible
+    without doing mental math. If `broken_stage_idx` is given (the index of
+    the stage where the drop-off is abnormal, e.g. high click-through but
+    ~0 add-to-cart), that stage is colored red instead of the default scale
+    and the title flags it — pinpointing which layer likely has the
+    landing-page/tracking/creative problem, not just that spend was wasted.
+    No cartesian axes needed for a funnel trace, so — same lesson as the
+    mind map — they're excluded from the layout rather than risking a
+    stray axis bleeding into the chart."""
+    labels = [s[0] for s in stages]
+    values = [s[1] for s in stages]
+    palette = [CAT["blue"], CAT["aqua"], CAT["violet"], STATUS["good"]]
+    colors = [palette[i % len(palette)] for i in range(len(stages))]
+    if broken_stage_idx is not None and 0 <= broken_stage_idx < len(colors):
+        colors[broken_stage_idx] = STATUS["critical"]
+
+    step_pct = [100.0]
+    for i in range(1, len(values)):
+        step_pct.append((values[i] / values[i - 1] * 100) if values[i - 1] > 0 else 0.0)
+    text = [f"{v:,.0f}" if i == 0 else f"{v:,.0f}  ({p:.1f}% of prior stage)" for i, (v, p) in enumerate(zip(values, step_pct))]
+
     fig = go.Figure(go.Funnel(
-        y=["Impressions", "Link clicks", "Purchases"],
-        x=[impressions, link_clicks, purchases],
-        textinfo="value+percent initial",
-        marker=dict(color=[CAT["blue"], CAT["aqua"], STATUS["good"]]),
+        y=labels, x=values, text=text, textinfo="text",
+        marker=dict(color=colors),
         connector=dict(line=dict(color=INK["baseline"], width=1)),
     ))
     layout = {k: v for k, v in BASE_LAYOUT.items() if k not in ("xaxis", "yaxis", "legend")}
-    fig.update_layout(**layout, title=title, height=300, showlegend=False)
+    full_title = title if broken_stage_idx is None else f"{title} — ⚠️ check '{labels[broken_stage_idx]}'"
+    fig.update_layout(**layout, title=full_title, height=320, showlegend=False)
     return fig
 
 
