@@ -31,6 +31,7 @@ STATUS_ORDER = ["critical", "warning", "low_delivery", "insufficient_history", "
 R2_THRESHOLD = 0.35  # weighted-regression trend must clear this fit quality to be trusted
 CUT_NO_SALES_DAYS = 3  # Campaign/Ad set cut rule: zero sales on each of the last N days
 CLOSE_CATEGORIES = ["Feed / catalog", "KOL/UGC", "AI-generated", "Static image", "Video", "Other"]
+BUDGET_COLS = {"campaign": ("campaign_budget", "campaign_budget_type"), "adset": ("adset_budget", "adset_budget_type")}
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +205,35 @@ def _adjustment_section(budget_df, entity_col, entity_label):
     else:
         st.caption("📈 Backtest needs 4+ days of history per entity — not enough yet in this file.")
 
+    with_budget = budget_df.dropna(subset=["configured_budget"])
+    if len(with_budget):
+        with_budget = with_budget.copy()
+        with_budget["pacing_gap_pct"] = (with_budget["daily_spend_rate"] - with_budget["configured_budget"]) \
+            / with_budget["configured_budget"] * 100
+        off_pace = with_budget[with_budget["pacing_gap_pct"].abs() > 30] \
+            .reindex(with_budget["pacing_gap_pct"].abs().sort_values(ascending=False).index)
+        st.caption(
+            f"💰 {len(with_budget)} of {len(budget_df)} {entity_label.lower()}(s) have a Meta-configured "
+            f"daily budget in this file; suggestions for the rest are sized off inferred average spend."
+        )
+        if len(off_pace):
+            with st.expander(f"⚖️ {len(off_pace)} {entity_label.lower()}(s) spending well off their configured budget"):
+                st.caption("Actual average daily spend vs. the budget set in Meta — a large gap is a "
+                           "delivery/pacing signal, separate from the ROI-based call above.")
+                st.dataframe(
+                    off_pace[[entity_col, "configured_budget", "daily_spend_rate", "pacing_gap_pct"]],
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        entity_col: entity_label,
+                        "configured_budget": st.column_config.NumberColumn("Meta budget", format="$%.0f"),
+                        "daily_spend_rate": st.column_config.NumberColumn("Actual $/day", format="$%.0f"),
+                        "pacing_gap_pct": st.column_config.NumberColumn("Gap", format="%+.0f%%"),
+                    },
+                )
+    else:
+        st.caption(f"💰 No Meta-configured daily budgets found for {entity_label.lower()}s in this file — "
+                   "every suggestion is sized off inferred average spend.")
+
 
 def _budget_full_table_config(entity_col, entity_label):
     return {
@@ -214,7 +244,9 @@ def _budget_full_table_config(entity_col, entity_label):
         "roas": st.column_config.NumberColumn("ROAS", format="%.2fx"),
         "cpa": st.column_config.NumberColumn("CPA", format="$%.2f"),
         "predicted_roi": st.column_config.NumberColumn("Predicted ROI", format="%.2fx"),
-        "daily_spend_rate": st.column_config.NumberColumn("Current $/day", format="$%.0f"),
+        "configured_budget": st.column_config.NumberColumn("Meta budget", format="$%.0f"),
+        "daily_spend_rate": st.column_config.NumberColumn("Actual $/day", format="$%.0f"),
+        "adjustment_baseline": st.column_config.NumberColumn("Sized off", format="$%.0f"),
         "adjustment_usd": st.column_config.NumberColumn("Suggested change", format="%+.0f"),
         "new_daily_budget": st.column_config.NumberColumn("New $/day", format="$%.0f"),
         "backtest_predicted": st.column_config.NumberColumn("Backtest: predicted", format="%.2fx"),
@@ -244,12 +276,15 @@ BUDGET_RULE_MD = (
     "there.\n\n"
     f"**How much, not just which way** — a **predicted ROI** (the trend one day further out, or the "
     f"blended ROAS when the trend isn't trusted) sizes the move: Scale adds up to "
-    f"**{max_adjust_pct:.0%}** of the current daily rate, scaled by how far predicted ROI clears "
-    "benchmark; Cut removes 50-90%, scaled by how much has already been wasted (every Cut here is "
-    "already a 'no sales in days' situation, so a shallow trim isn't the point). The **backtest** "
-    "columns refit the trend excluding the latest day, predict it, and compare to what actually "
-    "happened — a big gap there is a reason to trust today's prediction less and move the budget "
-    "more conservatively next time."
+    f"**{max_adjust_pct:.0%}** of the daily rate, scaled by how far predicted ROI clears benchmark; "
+    "Cut removes 50-90%, scaled by how much has already been wasted (every Cut here is already a 'no "
+    "sales in days' situation, so a shallow trim isn't the point). That 'daily rate' is your **actual "
+    "Meta-configured daily budget** when the file has one (Campaign Budget / Ad Set Budget columns) — "
+    "whichever level actually holds it, since Meta puts the budget on either the campaign (CBO) or "
+    "each ad set (ABO), never both — and falls back to inferred average spend otherwise. The "
+    "**backtest** columns refit the trend excluding the latest day, predict it, and compare to what "
+    "actually happened — a big gap there is a reason to trust today's prediction less and move the "
+    "budget more conservatively next time."
 )
 
 # ---------------------------------------------------------------------------
@@ -269,11 +304,12 @@ with tab_hierarchy:
         )
 
     def _mind_map_roll(sub_df, level_col):
+        budget_col, budget_type_col = BUDGET_COLS[level_col]
         roll = az.classify_budget_level(
             sub_df, level_col, benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
             cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
             cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
-            max_adjust_pct=max_adjust_pct,
+            max_adjust_pct=max_adjust_pct, budget_col=budget_col, budget_type_col=budget_type_col,
         )
         roll = roll.rename(columns={level_col: "label"})
         roll["bucket"] = roll["recommendation"]
@@ -335,7 +371,7 @@ with tab_campaign:
         df, "campaign", benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
         cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
         cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
-            max_adjust_pct=max_adjust_pct,
+        max_adjust_pct=max_adjust_pct, budget_col="campaign_budget", budget_type_col="campaign_budget_type",
     )
     _rec_counts_row(camp_df)
 
@@ -386,7 +422,7 @@ with tab_adset:
         df, "adset", benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
         cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
         cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
-            max_adjust_pct=max_adjust_pct,
+        max_adjust_pct=max_adjust_pct, budget_col="adset_budget", budget_type_col="adset_budget_type",
     )
     _rec_counts_row(adset_budget)
 
@@ -774,11 +810,24 @@ with tab_methodology:
         "**Predicted ROI** is the same weighted-regression trend from section 3, read one day further "
         "out (`fitted_end + slope_per_day`) when it's confident, or the blended window ROAS when it "
         "isn't — not a separate model, so it inherits the same R² honesty gate.\n\n"
-        f"**How much to adjust** (`adjustment_usd`, sized off the current daily spend rate): Scale "
+        "**Sizing baseline** (`adjustment_baseline`) — your **actual Meta-configured daily budget** "
+        "(`configured_budget`) when the file has `Campaign Budget`/`Ad Set Budget` columns and this "
+        "entity's budget is a Daily one (a Lifetime budget is a total cap, not a daily rate, so it's "
+        "deliberately not used as one), else the inferred average daily spend rate. Meta puts the "
+        "actual budget on either the campaign (Campaign Budget Optimization) or each ad set (Ad Set "
+        "Budget Optimization), never both at once for the same entity — the other level's field comes "
+        "through as non-numeric text ('Using ad set budget' / 'Using campaign budget'), which is "
+        "already `NaN` by the time it gets here, so the fallback kicks in automatically for whichever "
+        "level doesn't hold the real number.\n\n"
+        f"**How much to adjust** (`adjustment_usd`, sized off `adjustment_baseline` above): Scale "
         f"adds up to **{max_adjust_pct:.0%}** of it, scaled by how far predicted ROI clears the "
         "benchmark; Cut removes 50-90%, scaled by how much cumulative spend has already been wasted "
         "(every Cut here already means \"no sales in N days,\" so a shallow trim understates it); "
         "Maintain suggests \\$0.\n\n"
+        "**Pacing gap** — a separate check, not a Scale/Cut signal: when `daily_spend_rate` (what "
+        "actually got spent) diverges from `configured_budget` (what Meta was told to spend) by more "
+        "than 30%, that entity is listed under 'spending well off their configured budget' — a "
+        "delivery/pacing problem worth checking on its own, independent of ROI.\n\n"
         "**Day-over-day tuning (backtest)** — refit the trend on every day *except* the most recent "
         "one, predict that held-out day, and compare to what actually happened "
         "(`backtest_predicted` / `backtest_actual` / `backtest_error_pct`). This is the app checking "

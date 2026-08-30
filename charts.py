@@ -141,17 +141,23 @@ def budget_adjustment_bar(df, entity_col, title, top_n=20):
     a diverging bar per entity, green bars extending right (Scale, $ to
     add) and red bars extending left (Cut, $ to remove). Maintain ($0)
     rows are excluded — a zero-length bar carries no information, only
-    clutter. Sorted by |adjustment| so the biggest moves are at the top."""
+    clutter. Sorted by |adjustment| so the biggest moves are at the top.
+    'Current' in the hover is `adjustment_baseline` — the entity's actual
+    Meta-configured daily budget when the file has one, else the inferred
+    average daily spend; the hover says which so the number isn't taken
+    for more precision than it has."""
     d = df[df["adjustment_usd"] != 0].copy()
     if d.empty:
         return None
     d = d.reindex(d["adjustment_usd"].abs().sort_values(ascending=True).index).tail(top_n)
     colors = [STATUS["good"] if v > 0 else STATUS["critical"] for v in d["adjustment_usd"]]
+    baseline_source = np.where(d["configured_budget"].notna() if "configured_budget" in d.columns else False,
+                                "Meta-set budget", "inferred from spend")
     fig = go.Figure(go.Bar(
         x=d["adjustment_usd"], y=[str(t)[:30] for t in d[entity_col]], orientation="h",
         marker_color=colors,
-        customdata=np.stack([d[entity_col], d["daily_spend_rate"], d["new_daily_budget"]], axis=-1),
-        hovertemplate="<b>%{customdata[0]}</b><br>Current $%{customdata[1]:,.0f}/day → "
+        customdata=np.stack([d[entity_col], d["adjustment_baseline"], d["new_daily_budget"], baseline_source], axis=-1),
+        hovertemplate="<b>%{customdata[0]}</b><br>Current $%{customdata[1]:,.0f}/day (%{customdata[3]}) → "
                       "New $%{customdata[2]:,.0f}/day<br>Change %{x:+,.0f}/day<extra></extra>",
         text=[f"{v:+,.0f}/day" for v in d["adjustment_usd"]], textposition="outside",
     ))

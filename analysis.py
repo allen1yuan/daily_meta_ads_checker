@@ -83,6 +83,10 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "cpm": ["cpm (cost per 1,000 impressions)", "cpm"],
     "frequency": ["frequency"],
     "reach": ["reach"],
+    "campaign_budget": ["campaign budget"],
+    "campaign_budget_type": ["campaign budget type"],
+    "adset_budget": ["ad set budget", "adset budget"],
+    "adset_budget_type": ["ad set budget type", "adset budget type"],
     "reporting_starts": ["reporting starts"],
     "reporting_ends": ["reporting ends"],
 }
@@ -242,6 +246,24 @@ def load_and_standardize(raw: pd.DataFrame) -> LoadResult:
             "that depend on it are unavailable; add it to your export to enable them."
         )
 
+    # --- Configured Meta budgets (Campaign Budget Optimization vs. Ad Set
+    # Budget Optimization). Meta exports the *other* level's field as
+    # non-numeric text ("Using ad set budget" / "Using campaign budget")
+    # when that level doesn't actually hold the budget — pd.to_numeric
+    # turns that into NaN naturally, which is exactly "not set here" (kept
+    # as NaN, not 0, so it isn't mistaken for an actual zero-dollar budget).
+    has_any_budget_col = False
+    for num_field, type_field in [("campaign_budget", "campaign_budget_type"), ("adset_budget", "adset_budget_type")]:
+        num_col, type_col = resolved[num_field], resolved[type_field]
+        df[num_field] = pd.to_numeric(working[num_col], errors="coerce") if num_col else np.nan
+        df[type_field] = working[type_col] if type_col else None
+        has_any_budget_col = has_any_budget_col or num_col is not None
+    if not has_any_budget_col:
+        notes.append(
+            "No 'Campaign Budget' / 'Ad Set Budget' columns found — budget-change suggestions are "
+            "sized off average daily spend instead of your actual Meta-configured budget."
+        )
+
     if totals_row_check is not None:
         summary_rows = totals_row_check.pop("summary_rows")
         computed_spend = df["spend"].sum()
@@ -362,11 +384,15 @@ def weighted_roas_trend(days: pd.Series, roas: pd.Series, weights: pd.Series,
 #   blended window ROAS. Not a separate model — it's the same trend line
 #   read one day further out, so its honesty is bounded by the same R² gate.
 # - `adjustment_pct` / `adjustment_usd` / `new_daily_budget` — how much to
-#   actually move the daily budget, not just which direction. Scale sizes
-#   the increase off how far `predicted_roi` clears the benchmark (capped at
-#   `max_adjust_pct`); Cut sizes the decrease off how much cumulative spend
-#   has already been wasted (50-90% — every Cut here already means "no sales
-#   in N days," so a shallow trim isn't the point); Maintain is $0.
+#   actually move the daily budget, not just which direction, sized off
+#   `adjustment_baseline`: the entity's actual Meta-configured daily budget
+#   (`configured_budget`, via `budget_col`/`budget_type_col`) when the file
+#   has one and it's a Daily (not Lifetime) budget, else the inferred
+#   `daily_spend_rate`. Scale sizes the increase off how far `predicted_roi`
+#   clears the benchmark (capped at `max_adjust_pct`); Cut sizes the
+#   decrease off how much cumulative spend has already been wasted (50-90%
+#   — every Cut here already means "no sales in N days," so a shallow trim
+#   isn't the point); Maintain is $0.
 # - `backtest_predicted` / `backtest_actual` / `backtest_error_pct` — refit
 #   the trend on every day EXCEPT the most recent one, predict that held-out
 #   day, and compare to what actually happened. This is the "did our model
@@ -386,6 +412,8 @@ def classify_budget_level(
     r2_threshold: float = 0.35,
     reference_days: list | None = None,
     max_adjust_pct: float = 0.5,
+    budget_col: str | None = None,
+    budget_type_col: str | None = None,
 ) -> pd.DataFrame:
     all_days = sorted(pd.to_datetime(pd.Series(reference_days)).unique()) if reference_days is not None \
         else sorted(df["day"].unique())
@@ -402,6 +430,20 @@ def classify_budget_level(
         overall_roas = total_revenue / total_spend if total_spend > 0 else np.nan
         overall_cpa = total_spend / total_purchases if total_purchases > 0 else np.nan
         daily_spend_rate = total_spend / n_days if n_days > 0 else 0.0
+
+        # Prefer the entity's actual Meta-configured daily budget as the
+        # sizing baseline over the inferred spend rate, when the file has
+        # one (a campaign under Ad Set Budget Optimization has no budget of
+        # its own, and vice versa — Meta exports that side as non-numeric
+        # text, which is already NaN by the time it gets here). A Lifetime
+        # budget isn't a daily rate, so it's deliberately not used as one.
+        configured_budget = np.nan
+        if budget_col is not None and budget_col in g.columns:
+            vals = g[budget_col].dropna()
+            types = g[budget_type_col].dropna() if budget_type_col in g.columns else pd.Series(dtype=object)
+            is_daily = len(types) and isinstance(types.iloc[0], str) and types.iloc[0].strip().lower() == "daily"
+            configured_budget = float(vals.iloc[0]) if len(vals) and is_daily else np.nan
+        adjustment_baseline = configured_budget if pd.notna(configured_budget) else daily_spend_rate
 
         if has_daily_granularity and latest_day is not None:
             today = g[g["day"] == latest_day]
@@ -445,36 +487,40 @@ def classify_budget_level(
         high_roi = pd.notna(today_roas) and today_roas >= benchmark_roas
         good_trend = trend.confident and trend.slope_per_day > 0
 
+        budget_note = (f" Sizing off your ${configured_budget:.0f}/day Meta budget." if pd.notna(configured_budget)
+                        else " No Meta-set daily budget found here — sizing off average spend instead.")
+
         if cut_condition:
             rec = "Cut"
             severity = min(1.0, total_spend / max(cut_cumulative_spend, 1.0) / 2)
             adjustment_pct = -(0.5 + 0.4 * severity)
             why = (f"${today_spend:.0f} spent today (${total_spend:.0f} cumulative) with zero sales across "
-                   f"the last {cut_no_sales_days} days — spend isn't converting.")
+                   f"the last {cut_no_sales_days} days — spend isn't converting.{budget_note}")
         elif high_roi or good_trend:
             rec = "Scale"
             headroom = (predicted_roi - benchmark_roas) / benchmark_roas if pd.notna(predicted_roi) and benchmark_roas > 0 else 0.05
             adjustment_pct = min(max(headroom, 0.05), max_adjust_pct)
             if high_roi:
-                why = f"Today's ROAS {today_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark."
+                why = f"Today's ROAS {today_roas:.2f}x is at/above the {benchmark_roas:.1f}x benchmark.{budget_note}"
             else:
                 why = (f"Today's ROAS isn't yet at benchmark, but the trend across {trend.n} days is confidently "
-                       f"improving (R²={trend.r2:.2f}, {trend.slope_per_day:+.3f}x/day).")
+                       f"improving (R²={trend.r2:.2f}, {trend.slope_per_day:+.3f}x/day).{budget_note}")
         else:
             rec = "Maintain"
             adjustment_pct = 0.0
             why = (f"No cut or scale signal — today's spend (${today_spend:.0f}) and trend don't call for a "
                    "change yet.")
 
-        adjustment_usd = daily_spend_rate * adjustment_pct
-        new_daily_budget = max(0.0, daily_spend_rate + adjustment_usd)
+        adjustment_usd = adjustment_baseline * adjustment_pct
+        new_daily_budget = max(0.0, adjustment_baseline + adjustment_usd)
 
         rows.append({
             level_col: entity, "active_days": n_days, "spend": total_spend, "revenue": total_revenue,
             "roas": overall_roas, "cpa": overall_cpa, "today_spend": today_spend, "today_roas": today_roas,
             "no_sales_recent": no_sales_recent, "trend_slope": trend.slope_per_day, "trend_r2": trend.r2,
             "trend_confident": trend.confident, "predicted_roi": predicted_roi,
-            "daily_spend_rate": daily_spend_rate, "adjustment_pct": adjustment_pct,
+            "daily_spend_rate": daily_spend_rate, "configured_budget": configured_budget,
+            "adjustment_baseline": adjustment_baseline, "adjustment_pct": adjustment_pct,
             "adjustment_usd": adjustment_usd, "new_daily_budget": new_daily_budget,
             "backtest_predicted": backtest_predicted, "backtest_actual": backtest_actual,
             "backtest_error_pct": backtest_error_pct, "recommendation": rec, "rationale": why,
