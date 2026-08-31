@@ -740,6 +740,12 @@ def detect_funnel_breakage(df: pd.DataFrame, min_clicks: float = 20.0, ctr_perce
 
     ctr_threshold = eligible["ctr"].quantile(ctr_percentile)
     flagged = eligible[(eligible["ctr"] >= ctr_threshold) & (eligible["add_to_cart"] == 0)].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=["ad", "creative_type", "ctr", "link_clicks", "add_to_cart", "detail"])
+    # `.apply(axis=1)` on a genuinely empty frame is a pandas footgun: with
+    # nothing to iterate, it can't infer the function returns one scalar per
+    # row and instead infers a multi-column DataFrame — the `flagged.empty`
+    # guard above is what actually prevents that, not just an optimization.
     flagged["detail"] = flagged.apply(
         lambda r: (f"CTR {r['ctr']:.2f}% (top {int((1 - ctr_percentile) * 100)}% of this file) with "
                    f"{int(r['link_clicks'])} clicks but 0 add-to-cart — check landing page / tracking, "
