@@ -26,8 +26,10 @@ st.set_page_config(page_title="Meta Ads Daily Checker", page_icon="📊", layout
 STATUS_LABELS = {
     "critical": "🔴 Critical", "warning": "🟠 Warning", "low_delivery": "⚪ Low delivery",
     "insufficient_history": "⬜ Insufficient history", "healthy": "🟢 Healthy",
+    "paused": "⚫ Paused", "not_delivering": "🔘 Not delivering",
 }
-STATUS_ORDER = ["critical", "warning", "low_delivery", "insufficient_history", "healthy"]
+STATUS_ORDER = ["critical", "warning", "low_delivery", "insufficient_history", "healthy", "paused", "not_delivering"]
+NON_ACTIVE_RECOMMENDATIONS = ("Off", "Not delivering")  # az.classify_budget_level's delivery-based short-circuit
 R2_THRESHOLD = 0.35  # weighted-regression trend must clear this fit quality to be trusted
 CUT_NO_SALES_DAYS = 3  # Campaign/Ad set cut rule: zero sales on each of the last N days
 CLOSE_CATEGORIES = ["Feed / catalog", "KOL/UGC", "AI-generated", "Static image", "Video", "Other"]
@@ -178,10 +180,21 @@ tab_hierarchy, tab_campaign, tab_adset, tab_ad, tab_methodology = st.tabs(
 
 def _rec_counts_row(rec_df):
     counts = rec_df["recommendation"].value_counts()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("🟢 Scale", int(counts.get("Scale", 0)))
-    c2.metric("🔵 Maintain", int(counts.get("Maintain", 0)))
-    c3.metric("🔴 Cut", int(counts.get("Cut", 0)))
+    n_off = int(counts.get("Off", 0) + counts.get("Not delivering", 0))
+    cols = st.columns(4 if n_off else 3)
+    cols[0].metric("🟢 Scale", int(counts.get("Scale", 0)))
+    cols[1].metric("🔵 Maintain", int(counts.get("Maintain", 0)))
+    cols[2].metric("🔴 Cut", int(counts.get("Cut", 0)))
+    if n_off:
+        cols[3].metric("⚫ Off / not delivering", n_off)
+
+
+def _active_only(budget_df):
+    """Excludes entities Meta itself reports as paused or not-delivering —
+    there's nothing to Scale/Maintain/Cut on something that isn't running,
+    so they're kept out of the primary charts (still visible, with why, in
+    the Full table below)."""
+    return budget_df[~budget_df["recommendation"].isin(NON_ACTIVE_RECOMMENDATIONS)]
 
 
 def _adjustment_section(budget_df, entity_col, entity_label):
@@ -231,7 +244,10 @@ def _budget_full_table_config(entity_col, entity_label):
 
 
 BUDGET_RULE_MD = (
-    f"Checked in order, same rule for Campaigns and Ad sets:\n\n"
+    f"Checked in order, same rule for Campaigns and Ad sets — but first: if the file has "
+    f"delivery-status columns and Meta itself reports the entity as **paused** or "
+    f"**not-delivering**, none of this runs — it's called **⚫ Off** / **🔘 Not delivering** "
+    f"directly and left out of the chart below (still visible, with why, in the full table).\n\n"
     f"1. 🔴 **Cut** — today's spend is over **\\${cut_today_spend:.0f}**, or cumulative window spend "
     f"is over **\\${cut_cumulative_spend:.0f}**, *and* there have been zero sales on **each of the "
     f"last {CUT_NO_SALES_DAYS} days** in the file. Spend without recent payoff.\n"
@@ -265,16 +281,22 @@ with tab_hierarchy:
             "full metrics.\n\n"
             "Every campaign's ad sets are fanned out below **at once** — scan for red (Cut) dots "
             "across the whole account instead of checking one campaign at a time. Individual ads "
-            "have their own tab — 🎨 Ad Performance."
+            "have their own tab — 🎨 Ad Performance.\n\n"
+            "Campaigns/ad sets Meta itself reports as paused or not-delivering are left out of the "
+            "map entirely (when the file has delivery-status columns) — there's nothing to Scale, "
+            "Maintain, or Cut on something that isn't running."
         )
+
+    DELIVERY_COLS = {"campaign": "campaign_delivery", "adset": "adset_delivery"}
 
     def _mind_map_roll(sub_df, level_col):
         roll = az.classify_budget_level(
             sub_df, level_col, benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
             cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
             cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
-            max_adjust_pct=max_adjust_pct,
+            max_adjust_pct=max_adjust_pct, delivery_col=DELIVERY_COLS[level_col],
         )
+        roll = _active_only(roll)
         roll = roll.rename(columns={level_col: "label"})
         roll["bucket"] = roll["recommendation"]
         return roll.sort_values("spend", ascending=False)
@@ -335,14 +357,18 @@ with tab_campaign:
         df, "campaign", benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
         cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
         cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
-            max_adjust_pct=max_adjust_pct,
+        max_adjust_pct=max_adjust_pct, delivery_col="campaign_delivery",
     )
     _rec_counts_row(camp_df)
+    active_camp_df = _active_only(camp_df)
+    if len(active_camp_df) < len(camp_df):
+        st.caption(f"🔇 {len(camp_df) - len(active_camp_df)} campaign(s) already paused/not-delivering in "
+                   "Meta — excluded from the chart and adjustments below, still visible in the full table.")
 
     if hdg:
-        fig = ch.budget_quadrant(camp_df, "campaign", benchmark_roas, breakeven_roas, "Campaigns: performance vs. potential")
+        fig = ch.budget_quadrant(active_camp_df, "campaign", benchmark_roas, breakeven_roas, "Campaigns: performance vs. potential")
     else:
-        fig = ch.budget_bar_snapshot(camp_df, "campaign", "Campaigns by spend, colored by recommendation")
+        fig = ch.budget_bar_snapshot(active_camp_df, "campaign", "Campaigns by spend, colored by recommendation")
     if fig is not None:
         st.plotly_chart(fig, use_container_width=True)
         if hdg:
@@ -359,7 +385,7 @@ with tab_campaign:
         c2.plotly_chart(ch.daily_roas_chart(daily_all, breakeven_roas, benchmark_roas), use_container_width=True)
 
     st.subheader("How much to adjust")
-    _adjustment_section(camp_df, "campaign", "Campaign")
+    _adjustment_section(active_camp_df, "campaign", "Campaign")
 
     with st.expander("📋 Full campaign table"):
         st.dataframe(
@@ -386,14 +412,18 @@ with tab_adset:
         df, "adset", benchmark_roas=benchmark_roas, has_daily_granularity=hdg,
         cut_today_spend=cut_today_spend, cut_cumulative_spend=cut_cumulative_spend,
         cut_no_sales_days=CUT_NO_SALES_DAYS, r2_threshold=R2_THRESHOLD, reference_days=all_window_days,
-            max_adjust_pct=max_adjust_pct,
+        max_adjust_pct=max_adjust_pct, delivery_col="adset_delivery",
     )
     _rec_counts_row(adset_budget)
+    active_adset_budget = _active_only(adset_budget)
+    if len(active_adset_budget) < len(adset_budget):
+        st.caption(f"🔇 {len(adset_budget) - len(active_adset_budget)} ad set(s) already paused/not-delivering "
+                   "in Meta — excluded from the chart and adjustments below, still visible in the full table.")
 
     if hdg:
-        fig = ch.budget_quadrant(adset_budget, "adset", benchmark_roas, breakeven_roas, "Ad sets: performance vs. potential")
+        fig = ch.budget_quadrant(active_adset_budget, "adset", benchmark_roas, breakeven_roas, "Ad sets: performance vs. potential")
     else:
-        fig = ch.budget_bar_snapshot(adset_budget, "adset", "Ad sets by spend, colored by recommendation")
+        fig = ch.budget_bar_snapshot(active_adset_budget, "adset", "Ad sets by spend, colored by recommendation")
     if fig is not None:
         st.plotly_chart(fig, use_container_width=True)
         if hdg:
@@ -432,7 +462,7 @@ with tab_adset:
         st.success("No anomalies detected at the current thresholds.")
 
     st.subheader("How much to adjust")
-    _adjustment_section(adset_budget, "adset", "Ad set")
+    _adjustment_section(active_adset_budget, "adset", "Ad set")
 
     with st.expander("📋 Full ad set table"):
         st.dataframe(
@@ -446,8 +476,12 @@ with tab_adset:
 with tab_ad:
     with st.expander("ℹ️ How this is decided"):
         st.markdown(
+            "**Whether it's even still running comes first** — if the file has an Ad Delivery "
+            "column and Meta reports an ad as paused or not-delivering, it's called **⚫ Paused** / "
+            "**🔘 Not delivering** directly: excluded from Ads to close and Setup issues (nothing to "
+            "close or diagnose on something that's already off), shown as its own status below.\n\n"
             "**Status** (Critical/Warning/Healthy, shown below and available in the ranking table) "
-            "checks data sufficiency before performance, same as before — see `classify_ads` in the "
+            "then checks data sufficiency before performance — see `classify_ads` in the "
             "Methodology tab.\n\n"
             "**Ads to close** — a stricter, customizable rule: cumulative spend past a floor with "
             "zero purchases, *and* recent CTR/CPM/add-to-cart are all bad at once, per ad category. "
@@ -465,15 +499,18 @@ with tab_ad:
     ads_df = az.classify_ads(
         df, benchmark_roas=benchmark_roas, has_daily_granularity=hdg, breakeven_roas=breakeven_roas,
         min_window_spend=min_window_spend, min_active_days=min_active_days, refresh_ratio=refresh_ratio,
-        r2_threshold=R2_THRESHOLD,
+        r2_threshold=R2_THRESHOLD, delivery_col="ad_delivery",
     )
     status_counts = ads_df["status"].value_counts()
-    s1, s2, s3, s4, s5 = st.columns(5)
-    s1.metric("🔴 Critical", int(status_counts.get("critical", 0)))
-    s2.metric("🟠 Warning", int(status_counts.get("warning", 0)))
-    s3.metric("🟢 Healthy", int(status_counts.get("healthy", 0)))
-    s4.metric("⚪ Low delivery", int(status_counts.get("low_delivery", 0)))
-    s5.metric("⬜ Insufficient", int(status_counts.get("insufficient_history", 0)))
+    n_paused = int(status_counts.get("paused", 0) + status_counts.get("not_delivering", 0))
+    s_cols = st.columns(6 if n_paused else 5)
+    s_cols[0].metric("🔴 Critical", int(status_counts.get("critical", 0)))
+    s_cols[1].metric("🟠 Warning", int(status_counts.get("warning", 0)))
+    s_cols[2].metric("🟢 Healthy", int(status_counts.get("healthy", 0)))
+    s_cols[3].metric("⚪ Low delivery", int(status_counts.get("low_delivery", 0)))
+    s_cols[4].metric("⬜ Insufficient", int(status_counts.get("insufficient_history", 0)))
+    if n_paused:
+        s_cols[5].metric("⚫ Paused/not delivering", n_paused)
 
     # -------------------------------------------------------------------
     # Ads to close — customizable per-category thresholds
@@ -519,7 +556,7 @@ with tab_ad:
 
     close_df = az.evaluate_ads_to_close(
         df, category_thresholds, has_add_to_cart=has_add_to_cart, lookback_days=CUT_NO_SALES_DAYS,
-        reference_days=all_window_days, has_daily_granularity=hdg,
+        reference_days=all_window_days, has_daily_granularity=hdg, delivery_col="ad_delivery",
     )
     to_close = close_df[close_df["should_close"]]
     if len(to_close):
@@ -550,7 +587,7 @@ with tab_ad:
         st.info("Needs an 'Adds to cart' column in the export — not present in this file, so this "
                  "check is unavailable.")
     else:
-        funnel_breaks = az.detect_funnel_breakage(df, min_clicks=20.0, ctr_percentile=0.7)
+        funnel_breaks = az.detect_funnel_breakage(df, min_clicks=20.0, ctr_percentile=0.7, delivery_col="ad_delivery")
         funnel_break_ads = set(funnel_breaks["ad"])
         if len(funnel_breaks):
             for _, r in funnel_breaks.head(6).iterrows():
@@ -759,6 +796,14 @@ with tab_methodology:
         f"map too (`analysis.py::classify_budget_level`). With your current sidebar values (cut "
         f"today-spend **\\${cut_today_spend:.0f}**, cut cumulative spend **\\${cut_cumulative_spend:.0f}**, "
         f"benchmark **{benchmark_roas:.2f}x**, max adjustment **{max_adjust_pct:.0%}**):\n\n"
+        "**0. Is it even running?** If the file has `Campaign Delivery` / `Ad set delivery` columns "
+        "(`delivery_col`) and the entity's most recent value there isn't `active`, everything below is "
+        "skipped: it's labeled **🔇 Off** (`inactive`) or **Not delivering** directly, with `adjustment_usd` "
+        "fixed at \\$0, and excluded from the chart and the 'How much to adjust' section (app.py's "
+        "`_active_only`) — kept in the full table for transparency, since Meta's own status for "
+        "something already paused is more authoritative than any spend/ROAS pattern in the file. Missing "
+        "the column entirely (or a status the file doesn't set) degrades to 'can't tell, don't block' — "
+        "every entity is judged as before.\n\n"
         f"1. **🔴 Cut** — today's spend is over \\${cut_today_spend:.0f}, or cumulative window spend "
         f"is over \\${cut_cumulative_spend:.0f}, *and* zero sales on **each of the last "
         f"{CUT_NO_SALES_DAYS} days** in the file.\n"
@@ -813,7 +858,13 @@ with tab_methodology:
     st.subheader("6. Ads to close, setup issues & ranking")
     st.markdown(
         f"`analysis.py::classify_ads` still runs first — same weighted-regression trend as above, "
-        "checked in order, data sufficiency before performance:\n\n"
+        "checked in order, **whether it's even still running first**:\n\n"
+        "0. ⚫ **Paused** / 🔘 **Not delivering** — the file's `Ad Delivery` column (`delivery_col`) "
+        "says this ad's most recent status isn't `active`. Nothing below runs for it; it's also "
+        "excluded from Ads to close and Setup / landing page issues (`evaluate_ads_to_close` and "
+        "`detect_funnel_breakage` both take the same `delivery_col`) — no point recommending to close "
+        "or diagnosing an ad that's already off. Missing the column degrades to 'can't tell, don't "
+        "block,' same as the Campaign/Ad set version in section 4.\n"
         f"1. ⬜ **Insufficient history** — fewer than {min_active_days} active day(s).\n"
         f"2. ⚪ **Low delivery** — total spend under \\${min_window_spend:,.0f}; ROAS here is sampling "
         "noise, not signal.\n"

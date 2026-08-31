@@ -83,6 +83,9 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "cpm": ["cpm (cost per 1,000 impressions)", "cpm"],
     "frequency": ["frequency"],
     "reach": ["reach"],
+    "campaign_delivery": ["campaign delivery"],
+    "adset_delivery": ["ad set delivery", "adset delivery"],
+    "ad_delivery": ["ad delivery"],
     "reporting_starts": ["reporting starts"],
     "reporting_ends": ["reporting ends"],
 }
@@ -242,6 +245,25 @@ def load_and_standardize(raw: pd.DataFrame) -> LoadResult:
             "that depend on it are unavailable; add it to your export to enable them."
         )
 
+    # --- Delivery status (Campaign Delivery / Ad set delivery / Ad Delivery)
+    # — normalized to lowercase ("active" / "inactive" / "not_delivering").
+    # Used to exclude paused/non-delivering entities from budget and
+    # close-ad recommendations: there's nothing to cut or close on
+    # something that's already off. Left as None (not "active") wherever
+    # the column is missing, so every downstream check degrades to "can't
+    # tell, don't block" rather than assuming everything is active.
+    has_any_delivery_col = False
+    for field_name in ["campaign_delivery", "adset_delivery", "ad_delivery"]:
+        col = resolved[field_name]
+        df[field_name] = working[col].astype(str).str.strip().str.lower().replace({"nan": None}) if col else None
+        has_any_delivery_col = has_any_delivery_col or col is not None
+    if not has_any_delivery_col:
+        notes.append(
+            "No delivery-status columns found (Campaign Delivery / Ad set delivery / Ad Delivery) — "
+            "paused or non-delivering entities won't be automatically excluded from budget or "
+            "ads-to-close recommendations."
+        )
+
     if totals_row_check is not None:
         summary_rows = totals_row_check.pop("summary_rows")
         computed_spend = df["spend"].sum()
@@ -374,7 +396,19 @@ def weighted_roas_trend(days: pd.Series, roas: pd.Series, weights: pd.Series,
 #   `backtest_predicted` and `backtest_actual` is a reason to trust today's
 #   `predicted_roi` less and move the budget more conservatively next time.
 #   Needs 4+ days to attempt at all (NaN otherwise).
+#
+# Before any of that: an entity Meta itself reports as paused
+# (`delivery_col` == "inactive") or enabled-but-not-delivering
+# ("not_delivering") short-circuits straight to a "🔇 Off" / "Not
+# delivering" recommendation with a $0 adjustment — there's nothing to cut
+# on something that's already off, and no budget to scale on something
+# that isn't currently spending. Unavailable (`delivery_col=None`, or the
+# file has no delivery column) degrades to "can't tell, don't block":
+# every entity is judged as before.
 # ---------------------------------------------------------------------------
+NON_ACTIVE_RECOMMENDATIONS = ("Off", "Not delivering")
+
+
 def classify_budget_level(
     df: pd.DataFrame,
     level_col: str,
@@ -386,6 +420,7 @@ def classify_budget_level(
     r2_threshold: float = 0.35,
     reference_days: list | None = None,
     max_adjust_pct: float = 0.5,
+    delivery_col: str | None = None,
 ) -> pd.DataFrame:
     all_days = sorted(pd.to_datetime(pd.Series(reference_days)).unique()) if reference_days is not None \
         else sorted(df["day"].unique())
@@ -402,6 +437,27 @@ def classify_budget_level(
         overall_roas = total_revenue / total_spend if total_spend > 0 else np.nan
         overall_cpa = total_spend / total_purchases if total_purchases > 0 else np.nan
         daily_spend_rate = total_spend / n_days if n_days > 0 else 0.0
+
+        delivery_status = None
+        if delivery_col is not None and delivery_col in g.columns:
+            recent = g[g["day"] == latest_day] if (has_daily_granularity and latest_day is not None) else g
+            vals = (recent if len(recent) else g)[delivery_col].dropna()
+            delivery_status = vals.iloc[-1] if len(vals) else None
+
+        if delivery_status is not None and delivery_status != "active":
+            rec = "Off" if delivery_status == "inactive" else "Not delivering"
+            why = ("Already paused in Meta — nothing to cut." if delivery_status == "inactive"
+                   else "Enabled but not currently delivering in Meta — nothing to size a budget change against.")
+            rows.append({
+                level_col: entity, "active_days": n_days, "spend": total_spend, "revenue": total_revenue,
+                "roas": overall_roas, "cpa": overall_cpa, "today_spend": np.nan, "today_roas": np.nan,
+                "no_sales_recent": False, "trend_slope": np.nan, "trend_r2": np.nan,
+                "trend_confident": False, "predicted_roi": np.nan, "daily_spend_rate": daily_spend_rate,
+                "adjustment_pct": 0.0, "adjustment_usd": 0.0, "new_daily_budget": daily_spend_rate,
+                "backtest_predicted": np.nan, "backtest_actual": np.nan, "backtest_error_pct": np.nan,
+                "recommendation": rec, "rationale": why, "delivery_status": delivery_status,
+            })
+            continue
 
         if has_daily_granularity and latest_day is not None:
             today = g[g["day"] == latest_day]
@@ -478,6 +534,7 @@ def classify_budget_level(
             "adjustment_usd": adjustment_usd, "new_daily_budget": new_daily_budget,
             "backtest_predicted": backtest_predicted, "backtest_actual": backtest_actual,
             "backtest_error_pct": backtest_error_pct, "recommendation": rec, "rationale": why,
+            "delivery_status": delivery_status,
         })
     return pd.DataFrame(rows).sort_values("spend", ascending=False).reset_index(drop=True)
 
@@ -569,10 +626,13 @@ def classify_ads(
     declining_spend_ratio: float = 0.3,
     declining_lookback: int = 2,
     r2_threshold: float = 0.35,
+    delivery_col: str | None = None,
 ) -> pd.DataFrame:
-    """Per-ad rollup + status classification. Data sufficiency is checked
-    before performance: an ad with too little history or spend is flagged
-    as such, not judged as good or bad."""
+    """Per-ad rollup + status classification. Whether the ad is even still
+    running is checked before data sufficiency, which is checked before
+    performance: an ad Meta reports as paused or not delivering is flagged
+    as such (nothing to act on), an ad with too little history or spend is
+    flagged as such (not judged as good or bad), only then is it judged."""
     rows = []
     for ad, g in df.groupby("ad"):
         g = g.sort_values("day")
@@ -580,6 +640,23 @@ def classify_ads(
         total_spend = g["spend"].sum()
         total_revenue = g["revenue"].sum()
         roas = total_revenue / total_spend if total_spend > 0 else np.nan
+
+        delivery_status = None
+        if delivery_col is not None and delivery_col in g.columns:
+            vals = g[delivery_col].dropna()
+            delivery_status = vals.iloc[-1] if len(vals) else None
+        if delivery_status is not None and delivery_status != "active":
+            status = "paused" if delivery_status == "inactive" else "not_delivering"
+            rec = ("Already paused in Meta — no action needed here." if delivery_status == "inactive"
+                   else "Enabled but not currently delivering in Meta.")
+            rows.append({
+                "ad": ad, "creative_type": g["creative_type"].iloc[0], "active_days": active_days,
+                "spend": total_spend, "revenue": total_revenue, "roas": roas, "trend_slope": np.nan,
+                "trend_r2": np.nan, "trend_confident": False, "spend_trend_ratio": np.nan,
+                "delivery_declining": False, "status": status, "recommendation": rec,
+                "delivery_status": delivery_status,
+            })
+            continue
 
         trend = Trend(n=0)
         if has_daily_granularity:
@@ -621,10 +698,12 @@ def classify_ads(
             "roas": roas, "trend_slope": trend.slope_per_day, "trend_r2": trend.r2,
             "trend_confident": trend.confident, "spend_trend_ratio": spend_trend_ratio,
             "delivery_declining": delivery_declining, "status": status, "recommendation": rec,
+            "delivery_status": delivery_status,
         })
 
     out = pd.DataFrame(rows)
-    status_order = {"critical": 0, "warning": 1, "low_delivery": 2, "insufficient_history": 3, "healthy": 4}
+    status_order = {"critical": 0, "warning": 1, "low_delivery": 2, "insufficient_history": 3,
+                     "healthy": 4, "not_delivering": 5, "paused": 6}
     out["_order"] = out["status"].map(status_order)
     return out.sort_values(["_order", "spend"], ascending=[True, False]).drop(columns="_order").reset_index(drop=True)
 
@@ -645,11 +724,14 @@ def evaluate_ads_to_close(
     lookback_days: int = 3,
     reference_days: list | None = None,
     has_daily_granularity: bool = True,
+    delivery_col: str | None = None,
 ) -> pd.DataFrame:
     """Per ad: flag 'Close' when cumulative spend clears that ad's category
     threshold with zero purchases, AND its recent metrics (last
     `lookback_days`, or the whole window for a snapshot) are bad at once —
-    low CTR, high CPM, and (when the file has it) zero add-to-cart."""
+    low CTR, high CPM, and (when the file has it) zero add-to-cart. An ad
+    Meta already reports as paused/not-delivering is never flagged — there's
+    nothing left to close."""
     all_days = sorted(pd.to_datetime(pd.Series(reference_days)).unique()) if reference_days is not None \
         else sorted(df["day"].unique())
     recent_days = all_days[-lookback_days:] if has_daily_granularity and len(all_days) >= lookback_days else all_days
@@ -657,8 +739,21 @@ def evaluate_ads_to_close(
     rows = []
     for ad, g in df.groupby("ad"):
         category = g["creative_type"].iloc[0]
-        th = category_thresholds.get(category, category_thresholds.get("_default", DEFAULT_CLOSE_THRESHOLDS))
         total_spend = g["spend"].sum()
+
+        if delivery_col is not None and delivery_col in g.columns:
+            vals = g[delivery_col].dropna()
+            delivery_status = vals.iloc[-1] if len(vals) else None
+            if delivery_status is not None and delivery_status != "active":
+                rows.append({
+                    "ad": ad, "creative_type": category, "spend": total_spend,
+                    "purchases": g["purchases"].sum(), "add_to_cart": g["add_to_cart"].sum(),
+                    "recent_ctr": np.nan, "recent_cpm": np.nan, "should_close": False,
+                    "reasons": f"Already '{delivery_status}' in Meta — not evaluated.",
+                })
+                continue
+
+        th = category_thresholds.get(category, category_thresholds.get("_default", DEFAULT_CLOSE_THRESHOLDS))
         total_purchases = g["purchases"].sum()
         total_add_to_cart = g["add_to_cart"].sum()
 
@@ -724,16 +819,23 @@ def suggest_close_thresholds(df: pd.DataFrame, benchmark_roas: float, breakeven_
     return pd.DataFrame(rows)
 
 
-def detect_funnel_breakage(df: pd.DataFrame, min_clicks: float = 20.0, ctr_percentile: float = 0.7) -> pd.DataFrame:
+def detect_funnel_breakage(df: pd.DataFrame, min_clicks: float = 20.0, ctr_percentile: float = 0.7,
+                            delivery_col: str | None = None) -> pd.DataFrame:
     """Flags ads where people ARE clicking (CTR in the top band for this
     file) but essentially nobody adds to cart despite meaningful click
     volume — the classic signature of a broken landing page, wrong
     destination URL, or a tracking/pixel problem, not a creative problem.
     Distinct from the statistical CTR/CPC anomaly model: this is a fixed,
-    explainable rule about the shape of the funnel, not an outlier score."""
+    explainable rule about the shape of the funnel, not an outlier score.
+    An ad Meta already reports as paused/not-delivering is excluded —
+    there's nothing to check on something that isn't running."""
     ad_roll = window_rollup(df, ["ad"]).merge(
         df[["ad", "creative_type"]].drop_duplicates(), on="ad", how="left"
     )
+    if delivery_col is not None and delivery_col in df.columns:
+        last_status = df.sort_values("day").groupby("ad")[delivery_col].last().rename("_delivery_status")
+        ad_roll = ad_roll.merge(last_status, on="ad", how="left")
+        ad_roll = ad_roll[ad_roll["_delivery_status"].isna() | (ad_roll["_delivery_status"] == "active")]
     eligible = ad_roll[ad_roll["link_clicks"] >= min_clicks].copy()
     if eligible.empty:
         return pd.DataFrame(columns=["ad", "creative_type", "ctr", "link_clicks", "add_to_cart", "detail"])
